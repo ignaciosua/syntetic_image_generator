@@ -1,6 +1,8 @@
 # Generated / cache — large binaries, regeneratable
 dataset_cache/
 checkpoints/
+checkpoints_backup/
+demo_output/
 
 # Python
 __pycache__/
