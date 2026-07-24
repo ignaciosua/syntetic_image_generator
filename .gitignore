@@ -4,6 +4,9 @@ checkpoints/
 checkpoints_backup/
 demo_output/
 
+# Training run logs — artifacts of a specific run, regenerated every time
+train_multimodal_v*.log
+
 # Python
 __pycache__/
 *.pyc
