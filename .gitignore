@@ -1,7 +1,6 @@
 # Generated / cache — large binaries, regeneratable
 dataset_cache/
 checkpoints/
-checkpoints_backup/
 demo_output/
 
 # Training run logs — artifacts of a specific run, regenerated every time
@@ -11,9 +10,6 @@ train_multimodal_v*.log
 __pycache__/
 *.pyc
 *.pyo
-
-# Stray backup copies
-*synthetic_image_generator copy.py
 
 # OS
 .DS_Store
