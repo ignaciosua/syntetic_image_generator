@@ -34,7 +34,7 @@ from .synthetic_image_generator import (
 )
 from .wave import WAVE_LEVELS
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = [
     "Background",
