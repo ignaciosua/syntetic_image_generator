@@ -7,6 +7,21 @@ autoencoder that learns to reconstruct each modality and cross-decode between th
 Full history, decisions, and current numbers: see `PROJECT.md`. This file is
 just the map of where things live.
 
+## Generador de imágenes canónico
+
+Los consumidores activos importan
+`igc6_universal_selfcontained.generators`, la única implementación canónica
+del generador de imágenes, su schedule, escenas y ondas. Los módulos antiguos
+que todavía están bajo `generators/` se conservan temporalmente como snapshots
+compatibles para comandos históricos, pero no participan en entrenamiento
+nuevo.
+
+Para instalar también el namespace público `synthetic_image_generator`:
+
+```bash
+python -m pip install -r requirements-generator.txt
+```
+
 ## Layout
 
 Every runnable script lives 1 level deep and is meant to be invoked **from the repo
@@ -17,11 +32,9 @@ Each subfolder's scripts add `generators/`, `model/`, `training/`, `tools/` to
 folder the importing file lives in.
 
 ```
-generators/     the 6 content generators + shared rendering helpers
-  synthetic_*_generator.py   deterministic, idx -> content (image/audio/video + stereo)
-  levels.py                  level table shared by all generators
-  wave.py                    plane-wave-sum content family (levels 148-153), Sobol-sampled
-  scene.py / stereo.py / mel.py   scene attrs, stereo geometry, log-mel
+generators/     modality adapters and historical compatibility snapshots
+  synthetic_*_generator.py   deterministic audio/video/stereo generators
+  stereo.py / mel.py         stereo geometry and log-mel helpers
 
 model/          the shared-latent architecture itself
   config_multimodal.py       hyperparameters for the current 6-modality system
