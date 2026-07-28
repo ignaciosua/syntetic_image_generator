@@ -64,8 +64,18 @@ def theta(idx):
     global _POINTS
     if _POINTS is None:
         from scipy.stats import qmc      # local: only wave levels pay the import
-        _POINTS = qmc.Sobol(d=D, scramble=True, seed=SOBOL_SEED).random(N_SOBOL)
-    return _POINTS[int(idx) % N_SOBOL].astype(np.float32)
+        # Renderer inputs are float32. Fill in chunks so the full float64 Sobol
+        # table never coexists with its float32 copy. Sequential Sobol chunks
+        # are byte-identical to one ``random(N_SOBOL)`` call after conversion.
+        engine = qmc.Sobol(d=D, scramble=True, seed=SOBOL_SEED)
+        _POINTS = np.empty((N_SOBOL, D), np.float32)
+        chunk_size = 4096
+        for start in range(0, N_SOBOL, chunk_size):
+            stop = min(start + chunk_size, N_SOBOL)
+            _POINTS[start:stop] = engine.random(stop - start)
+        _POINTS.setflags(write=False)
+    # Return an owned vector so callers cannot mutate the process-wide cache.
+    return _POINTS[int(idx) % N_SOBOL].copy()
 
 
 def unpack(th, n):
