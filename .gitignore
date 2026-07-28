@@ -1,15 +1,31 @@
+# Legacy artifacts kept on disk but not in repo
+generators/
+legacy_single_modality/
+model/
+tools/
+training/
+logs/
+media/
+*.md
+!igc6_universal_selfcontained/README.md
+PROJECT.md
+PROMPT.md
+
 # Generated / cache — large binaries, regeneratable
 dataset_cache/
 checkpoints/
 demo_output/
-
-# Training run logs — artifacts of a specific run, regenerated every time
-train_multimodal_v*.log
+artifacts/
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+
+# Build artefacts
+dist/
+build/
+*.egg-info/
 
 # OS
 .DS_Store
