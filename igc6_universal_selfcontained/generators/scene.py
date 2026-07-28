@@ -34,6 +34,9 @@ import numpy as np
 PRIMO = 2246822519
 RANGES = {'energy': (0.45, 1.00), 'warmth': (-1.0, 1.0), 'contrast': (0.60, 1.40)}
 ATTRS = tuple(RANGES)
+_MT_N = 624
+_MT_M = 397
+_SCENE_BATCH_CHUNK = 8192
 
 
 def scene(idx):
@@ -41,6 +44,76 @@ def scene(idx):
     r = np.random.RandomState(int.from_bytes(
         hashlib.sha256(f"{idx}_{PRIMO}_scene".encode()).digest()[:4], "little"))
     return {k: float(r.uniform(lo, hi)) for k, (lo, hi) in RANGES.items()}
+
+
+def scene_values_batch(indices):
+    """Return raw ``(energy, warmth, contrast)`` values for many indices.
+
+    This is byte-equivalent after float32 conversion to repeatedly calling
+    :func:`scene`, but initializes MT19937 states across the whole batch with
+    NumPy vector operations.  GPU batches use it to avoid spending most of
+    their wall time constructing thousands of tiny ``RandomState`` objects.
+    """
+    batch_indices = [int(idx) for idx in indices]
+    result = np.empty((len(batch_indices), 3), np.float32)
+    for start in range(0, len(batch_indices), _SCENE_BATCH_CHUNK):
+        selected = batch_indices[start : start + _SCENE_BATCH_CHUNK]
+        seeds = np.fromiter(
+            (
+                int.from_bytes(
+                    hashlib.sha256(f"{idx}_{PRIMO}_scene".encode()).digest()[:4],
+                    "little",
+                )
+                for idx in selected
+            ),
+            dtype=np.uint32,
+            count=len(selected),
+        )
+        state = np.empty((_MT_N, len(selected)), np.uint32)
+        state[0] = seeds
+        for position in range(1, _MT_N):
+            previous = state[position - 1]
+            state[position] = (
+                np.uint64(1812433253)
+                * (previous ^ (previous >> np.uint32(30)))
+                + position
+            ).astype(np.uint32)
+
+        # RandomState.random_sample() consumes two tempered uint32 values per
+        # float64. Only the first six post-twist state words are needed for the
+        # three scene attributes, so the remainder of the twist is unnecessary.
+        words = np.empty((6, len(selected)), np.uint32)
+        for position in range(6):
+            combined = (
+                (state[position] & np.uint32(0x80000000))
+                | (state[position + 1] & np.uint32(0x7FFFFFFF))
+            )
+            value = (
+                state[position + _MT_M]
+                ^ (combined >> np.uint32(1))
+                ^ np.where(
+                    (combined & np.uint32(1)) != 0,
+                    np.uint32(0x9908B0DF),
+                    np.uint32(0),
+                )
+            )
+            value ^= value >> np.uint32(11)
+            value ^= (value << np.uint32(7)) & np.uint32(0x9D2C5680)
+            value ^= (value << np.uint32(15)) & np.uint32(0xEFC60000)
+            value ^= value >> np.uint32(18)
+            words[position] = value
+
+        draws = np.empty((len(selected), 3), np.float64)
+        for attribute in range(3):
+            high = (words[2 * attribute] >> np.uint32(5)).astype(np.uint64)
+            low = (words[2 * attribute + 1] >> np.uint32(6)).astype(np.uint64)
+            draws[:, attribute] = (
+                high * np.uint64(67108864) + low
+            ) / 9007199254740992.0
+        result[start : start + len(selected), 0] = 0.45 + draws[:, 0] * 0.55
+        result[start : start + len(selected), 1] = -1.0 + draws[:, 1] * 2.0
+        result[start : start + len(selected), 2] = 0.60 + draws[:, 2] * 0.80
+    return result
 
 
 def scene_vector(idx):

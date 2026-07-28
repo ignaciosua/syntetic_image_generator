@@ -2,7 +2,6 @@
 
 import argparse
 import math
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -10,10 +9,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "generators"))
-from levels import N_LEVELS, SAMPLES_PER_LEVEL, level_start
-from synthetic_image_generator import make_image
-from wave import WAVE_LEVELS
+from synthetic_image_generator import (
+    N_LEVELS,
+    SAMPLES_PER_LEVEL,
+    WAVE_LEVELS,
+    level_start,
+    make_image,
+)
 
 
 WAVE_NAMES = {

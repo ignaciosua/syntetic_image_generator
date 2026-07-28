@@ -22,24 +22,32 @@ from .scene_spec import (
     SceneSpec,
 )
 from .synthetic_image_generator import (
+    BATCH_BACKENDS,
+    BATCH_FIDELITIES,
+    GPU_LEVEL_FAMILIES,
     C,
     H,
     W,
+    cpu_info,
     convert_raster,
     extract_alpha,
     make_image,
+    make_images,
     make_image_raster,
     make_scene,
     make_scene_raster,
 )
+from ._webgpu import accelerator_info
+from ._version import __version__
 from .wave import WAVE_LEVELS
-
-__version__ = "0.2.2"
 
 __all__ = [
     "Background",
+    "BATCH_BACKENDS",
+    "BATCH_FIDELITIES",
     "C",
     "GENERATOR_CONTRACT_VERSION",
+    "GPU_LEVEL_FAMILIES",
     "H",
     "LEGACY_LEVEL_SAMPLE_SHA256",
     "LEVEL_CYCLE_SIZE",
@@ -56,12 +64,15 @@ __all__ = [
     "WAVE_LEVELS",
     "W",
     "__version__",
+    "accelerator_info",
+    "cpu_info",
     "convert_raster",
     "extract_alpha",
     "level_block",
     "level_of",
     "level_start",
     "make_image",
+    "make_images",
     "make_image_raster",
     "make_scene",
     "make_scene_raster",

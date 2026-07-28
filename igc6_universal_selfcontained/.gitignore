@@ -1,0 +1,15 @@
+# Keep this self-contained package source visible even when a parent workspace
+# ignores directories named ``generators``.
+!generators/
+!CHANGELOG.md
+!OPTIMIZATION_PLAN.md
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/

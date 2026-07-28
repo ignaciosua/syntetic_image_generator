@@ -4,7 +4,7 @@ synthetic_image_generator.py — Deterministic progressive visual generator.
 Single responsibility: given an integer index, return a 32×32×3 float32 image.
 Zero disk. Zero network. 100% deterministic (same idx = same image, always).
 
-100 levels of progressive visual complexity:
+154 levels of progressive visual complexity:
   1D → 2D → 3D → hollow → edges → palettes → textures →
   depth → creatures → flora → buildings → elements → scenes → chaos →
   styles → capture pipeline → vehicles → faces → optics → natural texture →
@@ -22,6 +22,11 @@ import math
 import sys
 import os
 import argparse
+import multiprocessing
+import threading
+import time
+from collections.abc import Iterable
+from functools import lru_cache
 from scipy.ndimage import gaussian_filter
 from scipy.fft import dctn, idctn
 from scipy.ndimage import map_coordinates, binary_fill_holes
@@ -34,8 +39,11 @@ H, W, C = 32, 32, 3  # output shape
 # learning. This file's own weighted table is gone with it — uneven per-level budgets
 # were six different opinions that could not be reconciled into one schedule.
 if __package__:
+    from ._primitive_ir import PrimitiveOp, command as _primitive_command
+    from ._rendergraph import RenderGraph
     from .levels import (
         N_LEVELS,
+        LEVEL_NAMES,
         LEVEL_TABLE,
         N_BLOCKS,
         SAMPLES_PER_LEVEL,
@@ -61,8 +69,11 @@ else:
     # Historical scripts add ``generators/`` directly to sys.path and import
     # this file as a top-level module. Keep that supported while the same files
     # are also mapped to the installed ``synthetic_image_generator`` package.
+    from _primitive_ir import PrimitiveOp, command as _primitive_command
+    from _rendergraph import RenderGraph
     from levels import (
         N_LEVELS,
+        LEVEL_NAMES,
         LEVEL_TABLE,
         N_BLOCKS,
         SAMPLES_PER_LEVEL,
@@ -143,12 +154,14 @@ def _tex_at(tex, x, y):
     """Bilinear sample from a (H,W) texture array at float coordinates."""
     x = np.clip(x, 0, W - 1.001)
     y = np.clip(y, 0, H - 1.001)
-    ix, iy = int(x), int(y)
+    ix = np.asarray(x).astype(np.intp)
+    iy = np.asarray(y).astype(np.intp)
     fx, fy = x - ix, y - iy
     return (tex[iy, ix] * (1 - fx) * (1 - fy) +
-            tex[iy, min(ix + 1, W - 1)] * fx * (1 - fy) +
-            tex[min(iy + 1, H - 1), ix] * (1 - fx) * fy +
-            tex[min(iy + 1, H - 1), min(ix + 1, W - 1)] * fx * fy)
+            tex[iy, np.minimum(ix + 1, W - 1)] * fx * (1 - fy) +
+            tex[np.minimum(iy + 1, H - 1), ix] * (1 - fx) * fy +
+            tex[np.minimum(iy + 1, H - 1),
+                np.minimum(ix + 1, W - 1)] * fx * fy)
 
 def _edge_sobel(ch):
     gx = np.abs(np.diff(ch, axis=1, append=ch[:, -1:]))
@@ -178,25 +191,39 @@ def _bresenham(img, x0, y0, x1, y1, thick, color):
             err += dx
             y0 += sy
 
+
+@lru_cache(maxsize=8)
+def _cached_ogrid(height, width):
+    """Return immutable broadcast grids reused by geometry-heavy primitives."""
+    yy, xx = np.ogrid[:height, :width]
+    yy.setflags(write=False)
+    xx.setflags(write=False)
+    return yy, xx
+
+
+def _canvas_ogrid():
+    return _cached_ogrid(H, W)
+
+
 def _sphere(cx, cy, R):
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     dd = ((xx - cx) ** 2 + (yy - cy) ** 2) / R ** 2
     m = dd <= 1.0
     return m, np.where(m, (xx - cx) / R, 0), np.where(m, (yy - cy) / R, 0), np.where(m, np.sqrt(np.maximum(0, 1.0 - dd)), 0)
 
 def _ellipse(cx, cy, rx, ry):
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     return ((xx - cx) ** 2 / rx ** 2 + (yy - cy) ** 2 / ry ** 2) <= 1
 
 def _cylinder_side(cx, cy, R):
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     dd = ((xx - cx) ** 2 + (yy - cy) ** 2) / R ** 2
     m = dd <= 1.0
     rr = np.sqrt(np.maximum(dd, 0)) * R
     return m, np.where(m, (xx - cx) / (rr + 1e-8), 0), np.where(m, (yy - cy) / (rr + 1e-8), 0)
 
 def _organic_blob(rng, cx, cy, rx, ry):
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     ang = np.arctan2(yy - cy, xx - cx)
     na = 24
     a = np.linspace(0, 2 * math.pi, na)
@@ -209,7 +236,7 @@ def _organic_blob(rng, cx, cy, rx, ry):
     return m, np.where(m, (xx - cx) / (wrx + 1e-8), 0), np.where(m, (yy - cy) / (wry + 1e-8), 0), np.where(m, np.sqrt(np.maximum(0, 1.0 - d ** 2)), 0)
 
 def _splat(rng, cx, cy, R):
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     rx, ry = R, R * rng.uniform(0.5, 1.8)
     ang = rng.uniform(0, math.pi)
     xr = (xx - cx) * math.cos(ang) + (yy - cy) * math.sin(ang)
@@ -225,7 +252,7 @@ def _splat(rng, cx, cy, R):
     return m, np.where(m, -(xx - cx) / (R + 1e-8), 0), np.where(m, -(yy - cy) / (R + 1e-8), 0), np.where(m, np.sqrt(np.maximum(0, 1.0 - d)), 0)
 
 def _hollow_ellipse(cx, cy, rx, ry, th):
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     do = ((xx - cx) ** 2 / rx ** 2 + (yy - cy) ** 2 / ry ** 2)
     tirx, tiry = rx - th, ry - th
     if tirx < 0.5 or tiry < 0.5:
@@ -245,7 +272,7 @@ def _hollow_rect(x, y, ww, hh, th):
 
 def _hollow_blob(rng, cx, cy, rx, ry, th=None):
     """Organic outline of constant width in pixels (a proportional ring reads as a donut)."""
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     ang = np.arctan2(yy - cy, xx - cx)
     na = 24
     a = np.linspace(0, 2 * math.pi, na)
@@ -404,9 +431,14 @@ def _perspective_grid(rng):
 
 _RIM = 0.0            # subsurface / rim-light strength
 _IRID = 0.0           # iridescence phase (0 = off)
-_SUBJECT_GAIN = 1.0   # ponytail: module global, single-threaded. A recursive base render
-                      # leaves its own value behind for the post levels — harmless extra variety.
+_SUBJECT_GAIN = 1.0   # A recursive base render leaves its own value behind for
+                      # post levels. Public access is isolated by _RENDER_LOCK.
 _LIGHT_COL = np.ones(3, np.float32)   # light source tint+intensity, see _rand_light_col()
+# The legacy renderer mutates the canvas dimensions and lighting state while it
+# recursively renders supersampled/post-processing levels.  Keep that exact
+# numerical contract, but isolate it from concurrent public calls.  Batch
+# parallelism uses processes, so each worker owns an independent renderer state.
+_RENDER_LOCK = threading.RLock()
 
 def _draw_3d(img, mask, Nx, Ny, Nz, light, color):
     lit = _phong(Nx, Ny, Nz, light)
@@ -670,17 +702,28 @@ def _fire(rng, img, zoom=1.0, base_y=None):
             t = i / max(ht, 1)
             w = wd * wf * max(0.0, 1.0 - t * 0.75)
             n_pts = max(3, int(w * 6))
-            for x in np.linspace(bx - w, bx + w, n_pts):
-                xi = int(x)
-                if 0 <= xi < W and 0 <= y < H:
-                    nx = _tex_at(tex, x, y)
-                    ox = (nx - 0.5) * wd * 0.5
-                    xi2 = int(np.clip(x + ox, 0, W - 1))
-                    dist = abs(x - bx) / max(w, 0.1)
-                    col = c_lo * (1 - dist) + c_hi * dist
-                    alpha = a_scale * (1.0 - t ** 1.3) * max(0.0, 1.0 - dist ** 0.55)
-                    if 0 <= xi2 < W:
-                        img[y, xi2] = np.clip(img[y, xi2] + col * alpha, 0, 1)
+            xs = np.linspace(bx - w, bx + w, n_pts)
+            valid = (np.trunc(xs).astype(np.intp) >= 0) & (
+                np.trunc(xs).astype(np.intp) < W
+            )
+            if not valid.any():
+                continue
+            xs = xs[valid]
+            noise = _tex_at(tex, xs, y)
+            offsets = (noise - 0.5) * wd * 0.5
+            target_x = np.clip(xs + offsets, 0, W - 1).astype(np.intp)
+            distance = np.abs(xs - bx) / max(w, 0.1)
+            colors = (
+                c_lo.reshape(1, C) * (1 - distance).reshape(-1, 1)
+                + c_hi.reshape(1, C) * distance.reshape(-1, 1)
+            )
+            alpha = (
+                a_scale
+                * (1.0 - t ** 1.3)
+                * np.maximum(0.0, 1.0 - distance ** 0.55)
+            )
+            np.add.at(img[y], target_x, colors * alpha.reshape(-1, 1))
+            np.clip(img[y], 0, 1, out=img[y])
     # embers
     for _ in range(rng.randint(6, 16)):
         ex = bx + rng.uniform(-wd * 0.5, wd * 0.5)
@@ -864,8 +907,8 @@ def _rect(x0, y0, x1, y1):
 def _render_at(res, idx, lvl, step=7):
     """Render one level on a res×res canvas (temporary global swap).
 
-    ponytail: module-global H/W swap, single-threaded only. Make them
-    parameters if this ever runs under threads.
+    Public render entry points hold ``_RENDER_LOCK`` while this legacy
+    module-global H/W swap is active.
     """
     global H, W
     oh, ow = H, W
@@ -940,13 +983,13 @@ def _tone_curve(img, rng, strength=None):
 
 def _vignette(img, rng, strength=None):
     s = rng.uniform(0.2, 0.7) if strength is None else strength
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     d = np.sqrt((xx - W / 2) ** 2 + (yy - H / 2) ** 2) / (0.5 * math.hypot(H, W))
     return np.clip(img * (1 - s * d ** 2).reshape(H, W, 1), 0, 1)
 
 def _soft_disc(cx, cy, R):
     """Antialiased disc alpha — the only way to get sub-pixel edges at 32px."""
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     d = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
     return np.clip(R - d + 0.5, 0, 1).astype(np.float32)
 
@@ -1018,7 +1061,7 @@ def _branch(img, rng, x, y, ang, length, thick, color, depth):
 
 def _tube(img, x0, y0, x1, y1, r, color, L, taper=1.0):
     """Shaded cylinder between two points — the 3D counterpart of a 2D stroke."""
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     dx, dy = x1 - x0, y1 - y0
     ln = math.sqrt(dx * dx + dy * dy) + 1e-8
     t = np.clip(((xx - x0) * dx + (yy - y0) * dy) / (ln * ln), 0, 1)
@@ -1033,7 +1076,7 @@ def _tube(img, x0, y0, x1, y1, r, color, L, taper=1.0):
 
 def _fire_tube(img, x0, y0, x1, y1, r, color, taper=1.0):
     """Emissive tube — additive, no phong (fire IS the light source)."""
-    yy, xx = np.ogrid[:H, :W]
+    yy, xx = _canvas_ogrid()
     dx, dy = x1 - x0, y1 - y0
     ln = math.sqrt(dx * dx + dy * dy) + 1e-8
     t = np.clip(((xx - x0) * dx + (yy - y0) * dy) / (ln * ln), 0, 1)
@@ -1311,8 +1354,8 @@ def _poisson(img, rng, photons=None):
     ph = rng.uniform(6, 140) if photons is None else photons
     return np.clip(rng.poisson(np.clip(img, 0, 1) * ph).astype(np.float32) / ph, 0, 1)
 
-def _reaction_diffusion(rng):
-    """Gray-Scott: spots, stripes, coral, mazes — how living surfaces actually pattern themselves."""
+def _reaction_diffusion_initial(rng):
+    """Prepare one deterministic Gray-Scott state without evolving it."""
     S = 32                                  # periodic boundary: the pattern tiles, no crop needed
     # only presets that actually develop within a few hundred steps (measured, dt must stay at 1.0)
     f, k = [(0.029, 0.057), (0.055, 0.062), (0.039, 0.058),
@@ -1323,14 +1366,36 @@ def _reaction_diffusion(rng):
     V = (seed > rng.uniform(0.55, 0.75)).astype(np.float32) * 0.25
     U -= V * 2
     V += rng.rand(S, S).astype(np.float32) * 0.02
+    steps = int(rng.randint(200, 340))
+    return U, V, float(f), float(k), steps
+
+
+def _reaction_diffusion_evolve(U, V, f, k, steps):
+    """Evolve a prepared state on CPU using the byte-exact legacy order."""
+    S = 32
     Du, Dv, dt = 0.16, 0.08, 1.0            # dt>1 blows the pattern away, verified empirically
-    for _ in range(rng.randint(200, 340)):
-        lu = (np.roll(U, 1, 0) + np.roll(U, -1, 0) + np.roll(U, 1, 1) + np.roll(U, -1, 1) - 4 * U)
-        lv = (np.roll(V, 1, 0) + np.roll(V, -1, 0) + np.roll(V, 1, 1) + np.roll(V, -1, 1) - 4 * V)
+    previous = np.r_[S - 1, np.arange(S - 1)]
+    following = np.r_[np.arange(1, S), 0]
+    for _ in range(steps):
+        # Direct periodic indexing preserves the legacy addition order while
+        # avoiding four general-purpose ``np.roll`` calls per field and step.
+        lu = (
+            U[previous, :] + U[following, :]
+            + U[:, previous] + U[:, following] - 4 * U
+        )
+        lv = (
+            V[previous, :] + V[following, :]
+            + V[:, previous] + V[:, following] - 4 * V
+        )
         uvv = U * V * V
         U += dt * (Du * lu - uvv + f * (1 - U))
         V += dt * (Dv * lv + uvv - (f + k) * V)
     return (V - V.min()) / (V.max() - V.min() + 1e-8)
+
+
+def _reaction_diffusion(rng):
+    """Gray-Scott: spots, stripes, coral, mazes — how living surfaces actually pattern themselves."""
+    return _reaction_diffusion_evolve(*_reaction_diffusion_initial(rng))
 
 def _curl_warp(rng, field, strength=None):
     """Advect a field along a divergence-free flow: filaments, swirls, turbulence.
@@ -4463,17 +4528,64 @@ def _render_image(idx: int, step: int = 7, force_level: int | None = None) -> np
     return np.clip(img, 0, 1).astype(np.float32)
 
 
+def _validated_index(idx):
+    if isinstance(idx, (bool, np.bool_)) or not isinstance(idx, (int, np.integer)):
+        raise TypeError("idx must be an integer")
+    idx = int(idx)
+    _level_block(idx)
+    return idx
+
+
+def _validated_step(step):
+    if (
+        isinstance(step, (bool, np.bool_))
+        or not isinstance(step, (int, np.integer))
+    ):
+        raise TypeError("step must be an integer")
+    step = int(step)
+    if step < 1:
+        raise ValueError("step must be positive")
+    return step
+
+
+def _validated_force_level(force_level):
+    if force_level is None:
+        return None
+    if (
+        isinstance(force_level, (bool, np.bool_))
+        or not isinstance(force_level, (int, np.integer))
+    ):
+        raise TypeError("force_level must be an integer or None")
+    force_level = int(force_level)
+    if not 0 <= force_level < N_LEVELS:
+        raise ValueError(f"force_level must be between 0 and {N_LEVELS - 1}")
+    return force_level
+
+
+def _make_image_unlocked(idx, step, force_level, raster):
+    """Render one already-validated index while the caller owns the state lock."""
+    image = _apply_scene(_render_image(idx, step, force_level), _scene(idx))
+    if raster is None:
+        return image
+    source = (
+        _indexed_rgba(image, idx, force_level, raster)
+        if _raster_requests_alpha(raster)
+        else image
+    )
+    return convert_raster(source, raster)
+
+
 def make_image(
     idx: int,
     step: int = 7,
     force_level: int | None = None,
     raster: RasterSpec | None = None,
 ) -> np.ndarray:
-    """Generate a deterministic 32×32×3 image from an integer index.
+    """Generate a deterministic image from one non-negative integer index.
 
     Args:
         idx:  Integer seed — same idx always returns the same image.
-        step: Skip between consecutive hash-indices (default 7).
+        step: Positive skip between consecutive hash-indices (default 7).
         force_level: If set, use this level instead of deriving from idx.
         raster: Optional output resolution, color mode, and bit depth.
 
@@ -4485,28 +4597,2247 @@ def make_image(
     recurses through _render_image for its style-filter and symmetry levels — inside,
     a level-136 image would get idx's brightness stacked on the base index's.
     """
-    if isinstance(idx, (bool, np.bool_)) or not isinstance(idx, (int, np.integer)):
-        raise TypeError("idx must be an integer")
-    idx = int(idx)
-    _level_block(idx)
-    if force_level is not None:
-        if (
-            isinstance(force_level, (bool, np.bool_))
-            or not isinstance(force_level, (int, np.integer))
-        ):
-            raise TypeError("force_level must be an integer or None")
-        force_level = int(force_level)
-        if not 0 <= force_level < N_LEVELS:
-            raise ValueError(f"force_level must be between 0 and {N_LEVELS - 1}")
-    image = _apply_scene(_render_image(idx, step, force_level), _scene(idx))
-    if raster is None:
-        return image
-    source = (
-        _indexed_rgba(image, idx, force_level, raster)
-        if _raster_requests_alpha(raster)
-        else image
+    idx = _validated_index(idx)
+    step = _validated_step(step)
+    force_level = _validated_force_level(force_level)
+    if raster is not None:
+        _validated_raster_spec(raster)
+    with _RENDER_LOCK:
+        return _make_image_unlocked(idx, step, force_level, raster)
+
+
+BATCH_BACKENDS: tuple[str, ...] = ("auto", "serial", "process", "webgpu")
+BATCH_FIDELITIES: tuple[str, ...] = ("legacy", "portable")
+_TRANSFORM_LEVELS = {129, 130, 133, 135, 136}
+_PRIMITIVE_LEVELS = {0, 1, 2, 3, 4, 6, 15, 16, 17, 18, 128, 142, 144}
+GPU_LEVEL_FAMILIES = {
+    **{level: "wave" for level in WAVE_LEVELS},
+    113: "reaction_diffusion",
+    **{level: "primitive_ir" for level in _PRIMITIVE_LEVELS},
+    **{level: "transform" for level in _TRANSFORM_LEVELS},
+}
+_RENDER_GRAPH_STAGES = {
+    # Start a preparation-free family first. While its command buffer is on
+    # the GPU, CPU workers can prepare the dependent branches below.
+    "wave": ("gpu",),
+    "reaction_diffusion": ("prepare", "gpu", "finish"),
+    "transform": ("prepare", "gpu", "finish"),
+    "primitive_ir": ("prepare", "gpu", "finish"),
+}
+_AUTO_WEBGPU_MIN_IMAGES = 64
+_AUTO_WEBGPU_RESULTS = {}
+_AUTO_WEBGPU_LOCK = threading.Lock()
+_AUTO_CPU_EXECUTORS = {}
+_AUTO_CPU_EXECUTORS_LOCK = threading.Lock()
+_CPU_TUNING_RESULTS = {}
+_CPU_TUNING_LOCK = threading.Lock()
+_CPU_AUTOTUNE_MIN_IMAGES = 256
+_CPU_AUTOTUNE_TTL_SECONDS = 15 * 60
+_WORKER_THREADPOOL_LIMITER = None
+_CPU_WORKER_WARMED = False
+
+
+def _make_image_task(arguments):
+    """Picklable worker entry point used by the process backend."""
+    idx, step, force_level, raster = arguments
+    return make_image(idx, step=step, force_level=force_level, raster=raster)
+
+
+def _worker_pid(_value):
+    """Small picklable task used to start a clean persistent CPU pool."""
+    return os.getpid()
+
+
+def _cpu_worker_init():
+    """Prevent nested native thread pools from multiplying every process."""
+    global _WORKER_THREADPOOL_LIMITER
+    for variable in (
+        "OPENBLAS_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[variable] = "1"
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        pass
+    else:
+        _WORKER_THREADPOOL_LIMITER = threadpool_limits(limits=1)
+    _warm_cpu_worker()
+
+
+def _cpu_worker_init_unrestricted():
+    """Warm a worker while retaining the native runtime's thread policy."""
+    _warm_cpu_worker()
+
+
+def _warm_cpu_worker():
+    """Initialize core renderer state once in each persistent worker."""
+    global _CPU_WORKER_WARMED
+    if _CPU_WORKER_WARMED:
+        return
+    if os.environ.get("SIG_CPU_WORKER_WARMUP", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        _CPU_WORKER_WARMED = True
+        return
+    make_image(0, force_level=0)
+    _CPU_WORKER_WARMED = True
+
+
+def _read_cpu_topology_value(cpu, name):
+    try:
+        with open(
+            f"/sys/devices/system/cpu/cpu{cpu}/topology/{name}",
+            encoding="ascii",
+        ) as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _cgroup_cpu_limit():
+    """Return an effective cgroup CPU quota, or None when unlimited."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="ascii") as handle:
+            quota, period = handle.read().split()[:2]
+        if quota != "max":
+            return max(1, math.ceil(int(quota) / int(period)))
+    except (OSError, ValueError, ZeroDivisionError):
+        pass
+    try:
+        with open(
+            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="ascii"
+        ) as handle:
+            quota = int(handle.read())
+        with open(
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="ascii"
+        ) as handle:
+            period = int(handle.read())
+        if quota > 0:
+            return max(1, math.ceil(quota / period))
+    except (OSError, ValueError, ZeroDivisionError):
+        pass
+    return None
+
+
+def _cpu_topology():
+    logical_system = os.cpu_count() or 1
+    try:
+        affinity = tuple(sorted(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        affinity = tuple(range(logical_system))
+    quota = _cgroup_cpu_limit()
+    available_logical = len(affinity)
+    if quota is not None:
+        available_logical = min(available_logical, quota)
+    physical_ids = set()
+    for cpu in affinity:
+        package = _read_cpu_topology_value(cpu, "physical_package_id")
+        core = _read_cpu_topology_value(cpu, "core_id")
+        if package is not None and core is not None:
+            physical_ids.add((package, core))
+    physical = len(physical_ids) or available_logical
+    physical = max(1, min(physical, available_logical))
+    model = ""
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.lower().startswith("model name"):
+                    model = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    numa_nodes = 1
+    try:
+        numa_nodes = max(
+            1,
+            sum(
+                name.startswith("node") and name[4:].isdigit()
+                for name in os.listdir("/sys/devices/system/node")
+            ),
+        )
+    except OSError:
+        pass
+    return {
+        "model": model,
+        "logical_system": logical_system,
+        "affinity_cpus": affinity,
+        "affinity_count": len(affinity),
+        "quota_cpus": quota,
+        "available_logical": max(1, available_logical),
+        "physical_cores": physical,
+        "smt_threads_per_core": max(
+            1, math.ceil(max(1, available_logical) / physical)
+        ),
+        "numa_nodes": numa_nodes,
+    }
+
+
+def _recommended_chunksize(count, workers):
+    target = max(1, math.ceil(count / max(1, workers * 8)))
+    target = min(target, 32)
+    lower = 1 << max(0, target.bit_length() - 1)
+    upper = min(32, lower * 2)
+    return lower if target - lower <= upper - target else upper
+
+
+def _cpu_workload_key(levels, count, raster, topology):
+    histogram = np.bincount(levels, minlength=N_LEVELS)
+    quantized = np.rint(histogram * 32 / max(count, 1)).astype(np.uint8)
+    distribution = hashlib.blake2b(
+        quantized.tobytes(), digest_size=8
+    ).hexdigest()
+    scale = 1 << max(0, min(12, count.bit_length() - 1))
+    raster_key = None
+    if raster is not None:
+        raster_key = (
+            int(raster.width),
+            int(raster.height),
+            str(raster.mode),
+            str(raster.bits_per_channel),
+            str(raster.resize),
+            str(raster.dither),
+            bool(raster.packed),
+        )
+    return (
+        topology["affinity_cpus"],
+        topology["quota_cpus"],
+        topology["physical_cores"],
+        scale,
+        distribution,
+        raster_key,
     )
-    return convert_raster(source, raster)
+
+
+def _cpu_autotune_enabled():
+    return os.environ.get("SIG_CPU_AUTOTUNE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _select_cpu_configuration(
+    batch_indices,
+    levels,
+    *,
+    step,
+    force_level,
+    raster,
+    requested_chunksize,
+    start_method,
+):
+    """Empirically select process count and chunk size for this CPU/workload."""
+    topology = _cpu_topology()
+    count = len(batch_indices)
+    fallback_workers = min(count, topology["physical_cores"])
+    fallback_chunk = (
+        _recommended_chunksize(count, fallback_workers)
+        if requested_chunksize is None
+        else requested_chunksize
+    )
+    key = _cpu_workload_key(levels, count, raster, topology)
+    now = time.monotonic()
+    safe_to_measure = (
+        _cpu_autotune_enabled()
+        and count >= _CPU_AUTOTUNE_MIN_IMAGES
+        and not multiprocessing.current_process().daemon
+        and (
+            start_method != "auto"
+            or (
+                sys.platform.startswith("linux")
+                and threading.active_count() == 1
+            )
+        )
+    )
+    with _CPU_TUNING_LOCK:
+        cached = _CPU_TUNING_RESULTS.get(key)
+        if (
+            cached is not None
+            and now - cached["measured_at"] < _CPU_AUTOTUNE_TTL_SECONDS
+        ):
+            return (
+                cached["workers"],
+                cached["chunksize"],
+                cached["limit_native_threads"],
+            )
+        if not safe_to_measure:
+            compatible = [
+                value
+                for candidate_key, value in _CPU_TUNING_RESULTS.items()
+                if candidate_key[:3] == key[:3]
+            ]
+            if compatible:
+                recent = max(
+                    compatible, key=lambda value: value["measured_at"]
+                )
+                return (
+                    recent["workers"],
+                    (
+                        recent["chunksize"]
+                        if requested_chunksize is None
+                        else requested_chunksize
+                    ),
+                    recent["limit_native_threads"],
+                )
+            return fallback_workers, fallback_chunk, True
+
+        sample_count = min(count, 1024)
+        positions = np.linspace(
+            0, count - 1, sample_count, dtype=np.int64
+        )
+        sample_indices = [batch_indices[int(position)] for position in positions]
+        available = min(sample_count, topology["available_logical"])
+        physical = min(available, topology["physical_cores"])
+        candidates = {
+            physical,
+            min(available, physical + max(1, physical // 2)),
+            available,
+        }
+        if count < 1024:
+            candidates.add(max(1, physical // 2))
+        if count < 512:
+            candidates.add(1)
+        candidates = sorted(value for value in candidates if value >= 1)
+        repeats = 1
+        timings = {}
+        from concurrent.futures import ProcessPoolExecutor
+
+        selected_start_method = _selected_process_start_method(start_method)
+        context = multiprocessing.get_context(selected_start_method)
+
+        def tasks():
+            return (
+                (idx, step, force_level, raster) for idx in sample_indices
+            )
+
+        def consume(executor, candidate_chunk):
+            for _image in executor.map(
+                _make_image_task, tasks(), chunksize=candidate_chunk
+            ):
+                pass
+
+        def measure_pool(
+            candidate_workers, chunk_values, limit_native_threads
+        ):
+            initializer = (
+                _cpu_worker_init
+                if limit_native_threads
+                else _cpu_worker_init_unrestricted
+            )
+            with ProcessPoolExecutor(
+                max_workers=candidate_workers,
+                mp_context=context,
+                initializer=initializer,
+            ) as executor:
+                list(
+                    executor.map(
+                        _worker_pid,
+                        range(candidate_workers),
+                        chunksize=1,
+                    )
+                )
+                warm_chunk = next(iter(chunk_values))
+                consume(executor, warm_chunk)
+                for candidate_chunk in chunk_values:
+                    values = []
+                    for _ in range(repeats):
+                        started = time.perf_counter()
+                        consume(executor, candidate_chunk)
+                        values.append(time.perf_counter() - started)
+                    timings[
+                        (
+                            candidate_workers,
+                            candidate_chunk,
+                            limit_native_threads,
+                        )
+                    ] = min(values)
+
+        for candidate_workers in candidates:
+            candidate_chunk = (
+                requested_chunksize
+                if requested_chunksize is not None
+                else _recommended_chunksize(
+                    sample_count, candidate_workers
+                )
+            )
+            measure_pool(candidate_workers, (candidate_chunk,), True)
+        best_workers, best_chunk, best_limit = min(
+            timings, key=timings.get
+        )
+        measure_pool(best_workers, (best_chunk,), False)
+        best_workers, best_chunk, best_limit = min(
+            timings, key=timings.get
+        )
+        if requested_chunksize is None and best_workers > 1:
+            chunk_candidates = {
+                max(1, best_chunk // 2),
+                best_chunk,
+                min(64, best_chunk * 2),
+            }
+            missing_chunks = tuple(
+                candidate_chunk
+                for candidate_chunk in sorted(chunk_candidates)
+                if (
+                    best_workers,
+                    candidate_chunk,
+                    best_limit,
+                )
+                not in timings
+            )
+            if missing_chunks:
+                measure_pool(best_workers, missing_chunks, best_limit)
+            best_workers, best_chunk, best_limit = min(
+                timings, key=timings.get
+            )
+
+        selected_executor = _auto_cpu_executor(
+            best_workers,
+            start_method,
+            limit_native_threads=best_limit,
+        )
+        warm_count = min(count, 2048)
+        warm_positions = np.linspace(
+            0, count - 1, warm_count, dtype=np.int64
+        )
+        warm_tasks = (
+            (
+                batch_indices[int(position)],
+                step,
+                force_level,
+                raster,
+            )
+            for position in warm_positions
+        )
+        warm_batch = _collect_batch(
+            selected_executor.map(
+                _make_image_task, warm_tasks, chunksize=best_chunk
+            ),
+            warm_count,
+        )
+        del warm_batch
+
+        _CPU_TUNING_RESULTS[key] = {
+            "workers": int(best_workers),
+            "chunksize": int(best_chunk),
+            "limit_native_threads": bool(best_limit),
+            "measured_at": now,
+            "sample_count": sample_count,
+            "candidates": {
+                (
+                    f"{workers}x{chunk}:"
+                    f"{'native1' if limited else 'native-auto'}"
+                ): seconds
+                for (workers, chunk, limited), seconds in sorted(
+                    timings.items()
+                )
+            },
+        }
+        return int(best_workers), int(best_chunk), bool(best_limit)
+
+
+def cpu_info():
+    """Describe usable CPU capacity and recent automatic tuning decisions."""
+    topology = _cpu_topology()
+    with _CPU_TUNING_LOCK:
+        tuning = [
+            {
+                "workers": value["workers"],
+                "chunksize": value["chunksize"],
+                "native_threads": (
+                    1
+                    if value["limit_native_threads"]
+                    else "runtime-default"
+                ),
+                "sample_count": value["sample_count"],
+                "age_seconds": max(
+                    0.0, time.monotonic() - value["measured_at"]
+                ),
+                "candidates": dict(value["candidates"]),
+            }
+            for value in _CPU_TUNING_RESULTS.values()
+        ]
+    try:
+        from threadpoolctl import threadpool_info
+
+        native_runtimes = [
+            {
+                "api": value.get("user_api"),
+                "runtime": value.get("internal_api"),
+                "threads": value.get("num_threads"),
+                "version": value.get("version"),
+                "architecture": value.get("architecture"),
+            }
+            for value in threadpool_info()
+        ]
+    except ImportError:
+        native_runtimes = []
+    try:
+        load_average = tuple(float(value) for value in os.getloadavg())
+    except (AttributeError, OSError):
+        load_average = ()
+    return {
+        **topology,
+        "autotune": _cpu_autotune_enabled(),
+        "autotune_min_images": _CPU_AUTOTUNE_MIN_IMAGES,
+        "native_thread_policy": "empirical",
+        "native_runtimes": native_runtimes,
+        "load_average": load_average,
+        "tuning": tuning,
+    }
+
+
+def _selected_process_start_method(start_method):
+    if start_method == "auto":
+        safe_to_fork = (
+            sys.platform.startswith("linux") and threading.active_count() == 1
+        )
+        return "fork" if safe_to_fork else "spawn"
+    return start_method
+
+
+def _auto_cpu_executor(
+    workers, start_method, *, limit_native_threads=True
+):
+    """Return workers created before a GPU runtime starts native threads."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    selected_start_method = _selected_process_start_method(start_method)
+    key = (int(workers), selected_start_method, bool(limit_native_threads))
+    with _AUTO_CPU_EXECUTORS_LOCK:
+        executor = _AUTO_CPU_EXECUTORS.get(key)
+        if executor is None:
+            context = multiprocessing.get_context(selected_start_method)
+            executor = ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=context,
+                initializer=(
+                    _cpu_worker_init
+                    if limit_native_threads
+                    else _cpu_worker_init_unrestricted
+                ),
+            )
+            # ProcessPoolExecutor launches all configured workers on its first
+            # submission. Do that while the parent is still GPU-free.
+            list(executor.map(_worker_pid, range(workers), chunksize=1))
+            _AUTO_CPU_EXECUTORS[key] = executor
+        return executor
+
+
+def _empty_batch(raster):
+    if raster is None:
+        return np.empty((0, H, W, C), np.float32)
+    mode, bits, _resize, _dither, packed = _validated_raster_spec(raster)
+    height, width = int(raster.height), int(raster.width)
+    if mode == "binary":
+        if packed:
+            return np.empty((0, height, math.ceil(width / 8)), np.uint8)
+        return np.empty((0, height, width), np.bool_)
+    if mode == "grayscale":
+        return np.empty(
+            (0, height, width), _unsigned_dtype(bits[0])
+        )
+    channels = 3 if mode == "rgb" else 4
+    if packed:
+        return np.empty(
+            (0, height, width), _unsigned_dtype(sum(bits))
+        )
+    return np.empty(
+        (0, height, width, channels), _unsigned_dtype(max(bits))
+    )
+
+
+def _collect_batch(results, count):
+    """Copy ordered worker results directly into one final contiguous array."""
+    iterator = iter(results)
+    first = np.asarray(next(iterator))
+    batch = np.empty((count, *first.shape), dtype=first.dtype)
+    batch[0] = first
+    for position, image in enumerate(iterator, start=1):
+        value = np.asarray(image)
+        if value.shape != first.shape or value.dtype != first.dtype:
+            raise RuntimeError("batch backend returned inconsistent image layouts")
+        batch[position] = value
+    return batch
+
+
+def _submit_render_graph_preparation(
+    graph, executor, specifications, *, chunksize
+):
+    """Submit every CPU→GPU dependency before unrelated CPU render work.
+
+    ``specifications`` maps a family to ``(callable, arguments)``. Each
+    argument value is passed as the callable's single picklable argument.
+    ``map`` retains process-pool chunking while its eager submission preserves
+    graph priority. Keeping this policy separate makes the rule testable.
+    """
+    pending = {}
+    for node in graph.topological_nodes():
+        if node.stage != "prepare" or node.family not in specifications:
+            continue
+        function, arguments = specifications[node.family]
+        pending[node.family] = executor.map(
+            function, arguments, chunksize=chunksize
+        )
+    return pending
+
+
+def _resolved_preparation(pending, family, fallback):
+    results = pending.get(family)
+    if results is None:
+        return list(fallback())
+    return list(results)
+
+
+def _portable_webgpu_batch(
+    batch_indices,
+    *,
+    step,
+    force_level,
+    raster,
+    workers,
+    chunksize,
+    start_method,
+    enabled_families=None,
+    shared_executor=None,
+):
+    """Render homogeneous GPU groups while CPU workers handle the remainder."""
+    from ._webgpu import render_wave_images
+
+    active_families = (
+        set(GPU_LEVEL_FAMILIES.values())
+        if enabled_families is None
+        else set(enabled_families)
+    )
+    levels = [
+        int(force_level) if force_level is not None else _level_of(idx)
+        for idx in batch_indices
+    ]
+    graph = RenderGraph.compile(
+        levels,
+        GPU_LEVEL_FAMILIES,
+        _RENDER_GRAPH_STAGES,
+        enabled_families=active_families,
+    )
+    wave_positions = list(graph.positions("wave"))
+    reaction_positions = list(graph.positions("reaction_diffusion"))
+    transform_positions = list(graph.positions("transform"))
+    primitive_positions = list(graph.positions("primitive_ir"))
+    cpu_positions = list(graph.positions("cpu"))
+    reaction_indices = [
+        batch_indices[position] for position in reaction_positions
+    ]
+    transform_indices = [
+        batch_indices[position] for position in transform_positions
+    ]
+    transform_levels = [levels[position] for position in transform_positions]
+    primitive_indices = [
+        batch_indices[position] for position in primitive_positions
+    ]
+    primitive_levels = [levels[position] for position in primitive_positions]
+
+    empty = _empty_batch(raster)
+    batch = np.empty(
+        (len(batch_indices), *empty.shape[1:]), dtype=empty.dtype
+    )
+    cpu_indices = [batch_indices[position] for position in cpu_positions]
+    cpu_executor = shared_executor
+    owns_executor = False
+    cpu_iterator = None
+    pending_preparation = {}
+    parallel_work_count = (
+        len(cpu_indices)
+        + len(reaction_indices)
+        + len(transform_indices)
+        + len(primitive_indices)
+    )
+    if parallel_work_count:
+        selected_workers = (
+            max(
+                1,
+                min(
+                    parallel_work_count,
+                    ((os.cpu_count() or 1) + 1) // 2,
+                ),
+            )
+            if workers is None
+            else workers
+        )
+        use_processes = (
+            parallel_work_count >= 64
+            and selected_workers > 1
+            and not multiprocessing.current_process().daemon
+        )
+        if use_processes:
+            from concurrent.futures import ProcessPoolExecutor
+
+            if cpu_executor is None:
+                if start_method == "auto":
+                    safe_to_fork = (
+                        sys.platform.startswith("linux")
+                        and threading.active_count() == 1
+                    )
+                    selected_start_method = (
+                        "fork" if safe_to_fork else "spawn"
+                    )
+                else:
+                    selected_start_method = start_method
+                context = multiprocessing.get_context(selected_start_method)
+                cpu_executor = ProcessPoolExecutor(
+                    max_workers=selected_workers,
+                    mp_context=context,
+                    initializer=_cpu_worker_init,
+                )
+                owns_executor = True
+            preparation_specs = {
+                "reaction_diffusion": (
+                    _prepare_reaction_task,
+                    [(idx, step) for idx in reaction_indices],
+                ),
+                "transform": (
+                    _prepare_transform_task,
+                    [
+                        (idx, level, step)
+                        for idx, level in zip(
+                            transform_indices, transform_levels
+                        )
+                    ],
+                ),
+                "primitive_ir": (
+                    _prepare_primitive_plan_task,
+                    [
+                        (idx, level, step)
+                        for idx, level in zip(
+                            primitive_indices, primitive_levels
+                        )
+                    ],
+                ),
+            }
+            pending_preparation = _submit_render_graph_preparation(
+                graph,
+                cpu_executor,
+                preparation_specs,
+                chunksize=chunksize,
+            )
+            if cpu_indices:
+                tasks = (
+                    (idx, step, force_level, raster) for idx in cpu_indices
+                )
+                # GPU dependencies were queued first. General CPU rendering
+                # now overlaps the device without starving its next branch.
+                cpu_iterator = cpu_executor.map(
+                    _make_image_task, tasks, chunksize=chunksize
+                )
+
+    try:
+        if wave_positions:
+            gpu_indices = [
+                batch_indices[position] for position in wave_positions
+            ]
+            gpu_levels = [levels[position] for position in wave_positions]
+            gpu_images = render_wave_images(gpu_indices, gpu_levels)
+            if raster is not None:
+                converted = []
+                for idx, image in zip(gpu_indices, gpu_images):
+                    source = (
+                        _indexed_rgba(image, idx, force_level, raster)
+                        if _raster_requests_alpha(raster)
+                        else image
+                    )
+                    converted.append(convert_raster(source, raster))
+                gpu_images = _collect_batch(converted, len(converted))
+            batch[np.asarray(wave_positions)] = gpu_images
+
+        if reaction_positions:
+            prepared_reactions = _resolved_preparation(
+                pending_preparation,
+                "reaction_diffusion",
+                lambda: (
+                    _prepare_reaction_item(idx, step)
+                    for idx in reaction_indices
+                ),
+            )
+            reaction_images = _portable_reaction_batch(
+                reaction_indices,
+                step=step,
+                force_level=force_level,
+                raster=raster,
+                prepared=prepared_reactions,
+                executor=cpu_executor,
+                chunksize=chunksize,
+            )
+            batch[np.asarray(reaction_positions)] = reaction_images
+
+        if transform_positions:
+            prepared = _resolved_preparation(
+                pending_preparation,
+                "transform",
+                lambda: (
+                    _prepare_transform_item(idx, level, step)
+                    for idx, level in zip(
+                        transform_indices, transform_levels
+                    )
+                ),
+            )
+            transform_images = _finish_portable_transform_batch(
+                transform_indices,
+                prepared,
+                force_level=force_level,
+                raster=raster,
+                executor=cpu_executor,
+                chunksize=chunksize,
+            )
+            batch[np.asarray(transform_positions)] = transform_images
+
+        if primitive_positions:
+            prepared_plans = _resolved_preparation(
+                pending_preparation,
+                "primitive_ir",
+                lambda: (
+                    _prepare_primitive_plan(idx, level, step)
+                    for idx, level in zip(
+                        primitive_indices, primitive_levels
+                    )
+                ),
+            )
+            primitive_images = _finish_portable_primitive_batch(
+                primitive_indices,
+                prepared_plans,
+                force_level=force_level,
+                raster=raster,
+                executor=cpu_executor,
+                chunksize=chunksize,
+            )
+            batch[np.asarray(primitive_positions)] = primitive_images
+
+        if cpu_indices:
+            if cpu_iterator is not None:
+                cpu_images = _collect_batch(cpu_iterator, len(cpu_indices))
+            else:
+                cpu_images = make_images(
+                    cpu_indices,
+                    step=step,
+                    force_level=force_level,
+                    raster=raster,
+                    backend="serial",
+                    workers=1,
+                    chunksize=chunksize,
+                    start_method=start_method,
+                    fidelity="legacy",
+                )
+            batch[np.asarray(cpu_positions)] = cpu_images
+        return batch
+    finally:
+        if owns_executor and cpu_executor is not None:
+            cpu_executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _prepare_reaction_item(idx, step):
+    """Advance the exact level-113 RNG stream up to its simulation."""
+    block = _level_block(idx)
+    lidx = idx % SAMPLES_PER_LEVEL
+    rng2 = _rng(lidx * max(1, step) + block * 100000)
+    hi_key = rng2.randint(0, 4) == 0
+    if rng2.randint(0, 8) > 0:
+        _backdrop(rng2, hi_key)
+    if hi_key and rng2.randint(0, 2) == 0:
+        rng2.uniform(0.1, 0.5)
+    if rng2.randint(0, 5) == 0:
+        rng2.uniform(0.15, 0.7)
+    if rng2.randint(0, 12) == 0:
+        rng2.uniform(0.1, 6.2)
+    _rand_light_col(rng2)
+    state = _reaction_diffusion_initial(rng2)
+    return rng2, hi_key, state
+
+
+def _prepare_reaction_task(arguments):
+    """Picklable reaction-planning entry point for the RenderGraph."""
+    return _prepare_reaction_item(*arguments)
+
+
+def _finish_reaction_item(rng2, hi_key, field):
+    """Finish level 113 after its GPU-computed simulation field."""
+    c1, c2 = _photo_color(rng2, 0.05, 0.6), _photo_color(rng2, 0.3, 0.98)
+    texture = field.reshape(H, W, 1)
+    if rng2.randint(0, 2) == 0:
+        texture = (
+            field > rng2.uniform(0.35, 0.65)
+        ).astype(np.float32).reshape(H, W, 1)
+    image = c1.reshape(1, 1, C) * (1 - texture) + c2.reshape(1, 1, C) * texture
+    if rng2.randint(0, 2) == 0:
+        light = _rand_light(rng2)
+        mask, nx, ny, nz = _organic_blob(
+            rng2,
+            W / 2 + rng2.uniform(-4, 4),
+            H / 2 + rng2.uniform(-4, 4),
+            rng2.uniform(8, 15),
+            rng2.uniform(8, 15),
+        )
+        lit = _phong(nx, ny, nz, light)
+        background = _backdrop(rng2, hi_key)
+        body = image.copy()
+        image = background
+        for channel in range(C):
+            image[:, :, channel][mask] = np.clip(
+                body[:, :, channel][mask] * lit[mask], 0, 1
+            )
+    if rng2.randint(0, 2) == 0:
+        image = np.ascontiguousarray(image[:, ::-1])
+    if rng2.randint(0, 3) > 0:
+        image = _natural_color(image, rng2)
+    if rng2.randint(0, 7) == 0:
+        image = _poisson(image, rng2)
+    if rng2.randint(0, 3) == 0:
+        image = gaussian_filter(
+            image, sigma=(rng2.uniform(0.3, 0.7),) * 2 + (0,)
+        )
+    return np.clip(image, 0, 1).astype(np.float32)
+
+
+def _finish_reaction_item_task(arguments):
+    """Finish scene/raster work for one GPU-computed reaction field."""
+    idx, prepared, field, force_level, raster = arguments
+    rng2, hi_key, _state = prepared
+    image = _apply_scene(
+        _finish_reaction_item(rng2, hi_key, field), _scene(idx)
+    )
+    if raster is not None:
+        source = (
+            _indexed_rgba(image, idx, force_level, raster)
+            if _raster_requests_alpha(raster)
+            else image
+        )
+        image = convert_raster(source, raster)
+    return image
+
+
+def _portable_reaction_batch(
+    batch_indices,
+    *,
+    step,
+    force_level,
+    raster,
+    prepared=None,
+    executor=None,
+    chunksize=32,
+):
+    """Render a homogeneous level-113 batch with GPU simulation and CPU finishing."""
+    from ._webgpu import render_reaction_fields
+
+    if prepared is None:
+        prepared = [
+            _prepare_reaction_item(idx, step) for idx in batch_indices
+        ]
+    initial_u = np.stack([item[2][0] for item in prepared])
+    initial_v = np.stack([item[2][1] for item in prepared])
+    parameters = np.asarray(
+        [
+            [item[2][2], item[2][3], item[2][4], 0.0]
+            for item in prepared
+        ],
+        np.float32,
+    )
+    fields = render_reaction_fields(initial_u, initial_v, parameters)
+    tasks = (
+        (idx, item, field, force_level, raster)
+        for idx, item, field in zip(batch_indices, prepared, fields)
+    )
+    images = (
+        executor.map(
+            _finish_reaction_item_task, tasks, chunksize=chunksize
+        )
+        if executor is not None
+        else map(_finish_reaction_item_task, tasks)
+    )
+    return _collect_batch(images, len(batch_indices))
+
+
+def _prepare_transform_item(idx, level, step):
+    """Build the CPU control-plane data for one recursive GPU transform."""
+    block = _level_block(idx)
+    lidx = idx % SAMPLES_PER_LEVEL
+    rng2 = _rng(lidx * max(1, step) + block * 100000)
+    base_level = rng2.randint(0, N_LEVELS)
+    while base_level in RECURSIVE_LEVELS:
+        base_level = rng2.randint(0, N_LEVELS)
+    base_idx = (
+        _level_start(base_level, rng2) + rng2.randint(0, SAMPLES_PER_LEVEL)
+    )
+    base = _render_image(base_idx, step, force_level=base_level)
+    parameters = np.zeros(12, np.float32)
+    displacement = np.zeros((H, W, 2), np.float32)
+    if level == 129:
+        parameters[0] = 0
+        parameters[1] = rng2.uniform(0, math.pi)
+    elif level == 130:
+        parameters[0] = 1
+        parameters[1] = rng2.randint(4, 11)
+        parameters[2] = rng2.uniform(0, 2 * math.pi)
+    elif level == 133:
+        parameters[0] = 2
+        parameters[1] = rng2.uniform(0, math.pi)
+        parameters[2] = rng2.uniform(1.5, 4.0)
+        parameters[3] = rng2.uniform(0.8, 2.2)
+    elif level == 135:
+        parameters[0] = 3
+        strength = rng2.uniform(1.5, 4.0)
+        displacement[:, :, 0] = (
+            _perlin(rng2, rng2.randint(3, 5)) - 0.5
+        ) * strength
+        displacement[:, :, 1] = (
+            _perlin(rng2, rng2.randint(3, 5)) - 0.5
+        ) * strength
+    elif level == 136:
+        parameters[0] = 4
+        light = _rand_light(rng2)
+        parameters[1] = rng2.uniform(7, W - 7)
+        parameters[2] = rng2.uniform(6, H - 6)
+        parameters[3] = rng2.uniform(5, 11)
+        parameters[4] = rng2.uniform(1.6, 3.0) * (
+            -1 if rng2.rand() < 0.4 else 1
+        )
+        parameters[5:8] = light
+    else:
+        raise ValueError(f"level {level} is not a portable transform")
+    return base, parameters, displacement
+
+
+def _prepare_transform_task(arguments):
+    """Picklable transform-planning entry point for the CPU process pool."""
+    return _prepare_transform_item(*arguments)
+
+
+def _portable_transform_batch(
+    batch_indices,
+    levels,
+    *,
+    step,
+    force_level,
+    raster,
+):
+    prepared = [
+        _prepare_transform_item(idx, level, step)
+        for idx, level in zip(batch_indices, levels)
+    ]
+    return _finish_portable_transform_batch(
+        batch_indices,
+        prepared,
+        force_level=force_level,
+        raster=raster,
+    )
+
+
+def _finish_portable_transform_batch(
+    batch_indices,
+    prepared,
+    *,
+    force_level,
+    raster,
+    executor=None,
+    chunksize=32,
+):
+    """Submit prepared transforms and finish their scene/raster pipeline."""
+    from ._webgpu import render_transform_images
+
+    bases = np.stack([item[0] for item in prepared])
+    parameters = np.stack([item[1] for item in prepared])
+    displacement = np.stack([item[2] for item in prepared])
+    transformed = render_transform_images(bases, parameters, displacement)
+    tasks = (
+        (idx, image, force_level, raster)
+        for idx, image in zip(batch_indices, transformed)
+    )
+    images = (
+        executor.map(
+            _finish_transform_item_task, tasks, chunksize=chunksize
+        )
+        if executor is not None
+        else map(_finish_transform_item_task, tasks)
+    )
+    return _collect_batch(images, len(batch_indices))
+
+
+def _finish_transform_item_task(arguments):
+    """Finish one transform graph branch after its GPU stage."""
+    idx, image, force_level, raster = arguments
+    image = _apply_scene(np.clip(image, 0, 1), _scene(idx))
+    if raster is not None:
+        source = (
+            _indexed_rgba(image, idx, force_level, raster)
+            if _raster_requests_alpha(raster)
+            else image
+        )
+        image = convert_raster(source, raster)
+    return image
+
+
+def _prepare_primitive_preamble(idx, level, step):
+    """Reproduce the shared legacy preamble and return its live RNG stream."""
+    block = _level_block(idx)
+    lidx = idx % SAMPLES_PER_LEVEL
+    rng2 = _rng(lidx * max(1, step) + block * 100000)
+    initial = np.zeros((H, W, C), np.float32)
+    hi_key = rng2.randint(0, 4) == 0
+    if level not in POST_LEVELS and rng2.randint(0, 8) > 0:
+        initial += _backdrop(rng2, hi_key)
+    subject_gain = (
+        rng2.uniform(0.1, 0.5)
+        if hi_key and rng2.randint(0, 2) == 0
+        else 1.0
+    )
+    rim = (
+        rng2.uniform(0.15, 0.7)
+        if rng2.randint(0, 5) == 0
+        else 0.0
+    )
+    iridescence = (
+        rng2.uniform(0.1, 6.2)
+        if rng2.randint(0, 12) == 0
+        else 0.0
+    )
+    light_color = _rand_light_col(rng2)
+    material = (subject_gain, rim, iridescence, light_color)
+    return initial, rng2, hi_key, material
+
+
+def _prepare_discrete_primitive_plan(idx, level, step):
+    """Compile levels 0–3 into ordered rectangles and Bresenham lines."""
+    initial, rng2, _hi_key, _material = _prepare_primitive_preamble(
+        idx, level, step
+    )
+    commands = []
+    if level == 0:
+        for _ in range(1 + rng2.randint(0, 4)):
+            px, py = rng2.randint(0, W), rng2.randint(0, H)
+            color = rng2.uniform(0.3, 1.0, C)
+            commands.append(
+                _primitive_command(
+                    PrimitiveOp.RECT,
+                    x0=px,
+                    y0=py,
+                    p0=px,
+                    p1=py,
+                    color=color,
+                )
+            )
+    elif level == 1:
+        for _ in range(3 + rng2.randint(0, 10)):
+            px, py = rng2.randint(0, W), rng2.randint(0, H)
+            size = rng2.randint(0, 2)
+            color = rng2.uniform(0.2, 1.0, C)
+            commands.append(
+                _primitive_command(
+                    PrimitiveOp.RECT,
+                    x0=px - size,
+                    y0=py - size,
+                    p0=px + size,
+                    p1=py + size,
+                    color=color,
+                )
+            )
+    elif level == 2:
+        for _ in range(1 + rng2.randint(0, 3)):
+            color = rng2.uniform(0.2, 1.0, C)
+            x0, y0 = rng2.randint(0, W), rng2.randint(0, H)
+            x1, y1 = rng2.randint(0, W), rng2.randint(0, H)
+            thickness = rng2.randint(0, 2)
+            commands.append(
+                _primitive_command(
+                    PrimitiveOp.BRESENHAM,
+                    x0=x0,
+                    y0=y0,
+                    p0=x1,
+                    p1=y1,
+                    p2=thickness,
+                    color=color,
+                )
+            )
+    elif level == 3:
+        points = [
+            (rng2.randint(0, W), rng2.randint(0, H))
+            for _ in range(3 + rng2.randint(0, 5))
+        ]
+        color = rng2.uniform(0.2, 1.0, C)
+        for start, end in zip(points, points[1:]):
+            thickness = rng2.randint(0, 1)
+            commands.append(
+                _primitive_command(
+                    PrimitiveOp.BRESENHAM,
+                    x0=start[0],
+                    y0=start[1],
+                    p0=end[0],
+                    p1=end[1],
+                    p2=thickness,
+                    color=color,
+                )
+            )
+    else:
+        raise ValueError(f"level {level} is not a discrete primitive plan")
+    return initial, np.stack(commands), rng2
+
+
+def _primitive_material_color(color, material):
+    subject_gain, _rim, _iridescence, light_color = material
+    return (
+        np.asarray(color, np.float32)
+        * np.float32(subject_gain)
+        * np.asarray(light_color, np.float32)
+    )
+
+
+def _prepare_geometry_primitive_plan(idx, level, step):
+    """Compile ellipse and analytic 3D levels into Primitive IR v2."""
+    initial, rng2, _hi_key, material = _prepare_primitive_preamble(
+        idx, level, step
+    )
+    commands = []
+    if level == 4:
+        for _ in range(1 + rng2.randint(0, 2)):
+            color = rng2.uniform(0.1, 0.9, C)
+            center_x = rng2.randint(5, W - 5)
+            center_y = rng2.randint(5, H - 5)
+            radius_x = rng2.randint(2, 11)
+            radius_y = rng2.randint(2, 11)
+            shape = rng2.randint(0, 3)
+            angle = 0.0
+            if shape == 1:
+                x = rng2.randint(0, W - 10)
+                y = rng2.randint(0, H - 10)
+                width = rng2.randint(3, 16)
+                height = rng2.randint(3, 16)
+                center_x, center_y = x + width / 2, y + height / 2
+                radius_x, radius_y = width / 2, height / 2
+            elif shape == 2:
+                radius_x = max(radius_x, radius_y)
+                radius_y = radius_x * rng2.uniform(0.5, 1.8)
+                angle = rng2.uniform(0, math.pi)
+                cosine, sine = math.cos(angle), math.sin(angle)
+                ellipses = [
+                    (center_x, center_y, radius_x, radius_y)
+                ]
+                for _ in range(rng2.randint(2, 5)):
+                    offset_x = rng2.uniform(
+                        -radius_x * 0.7, radius_x * 0.7
+                    )
+                    offset_y = rng2.uniform(
+                        -radius_x * 0.7, radius_x * 0.7
+                    )
+                    lobe_radius = rng2.uniform(
+                        radius_x * 0.3, radius_x * 0.9
+                    )
+                    scale = lobe_radius / radius_x
+                    ellipses.append(
+                        (
+                            center_x
+                            + offset_x * cosine
+                            - offset_y * sine,
+                            center_y
+                            + offset_x * sine
+                            + offset_y * cosine,
+                            radius_x * scale,
+                            radius_y * scale,
+                        )
+                    )
+                for ellipse in ellipses:
+                    commands.append(
+                        _primitive_command(
+                            PrimitiveOp.ELLIPSE,
+                            x0=ellipse[0],
+                            y0=ellipse[1],
+                            p0=ellipse[2],
+                            p1=ellipse[3],
+                            p2=angle,
+                            color=color,
+                        )
+                    )
+                continue
+            commands.append(
+                _primitive_command(
+                    PrimitiveOp.ELLIPSE,
+                    x0=center_x,
+                    y0=center_y,
+                    p0=radius_x,
+                    p1=radius_y,
+                    p2=angle,
+                    color=color,
+                )
+            )
+    elif level == 6:
+        center_x = rng2.randint(5, W - 5)
+        center_y = rng2.randint(5, H - 5)
+        radius_x = rng2.randint(3, 10)
+        radius_y = rng2.randint(3, 10)
+        base_color = rng2.uniform(0.0, 0.4, C)
+        yy, xx = np.ogrid[:H, :W]
+        distance = np.sqrt(
+            (xx - center_x) ** 2 / radius_x**2
+            + (yy - center_y) ** 2 / radius_y**2
+        )
+        mask = distance <= 1.0
+        maximum = float(distance[mask].max() + 1e-8)
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.ELLIPSE_GRADIENT,
+                x0=center_x,
+                y0=center_y,
+                p0=radius_x,
+                p1=radius_y,
+                opacity=0.7,
+                color=base_color,
+                extras=(maximum, 0, 0, 0),
+            )
+        )
+    elif level == 15:
+        center_x = rng2.randint(6, W - 6)
+        center_y = rng2.randint(6, H - 6)
+        radius = rng2.uniform(5, 13)
+        light = _rand_light(rng2)
+        color = _primitive_material_color(
+            rng2.uniform(0.1, 1.0, C), material
+        )
+        _subject_gain, rim, iridescence, _light_color = material
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.SPHERE_PHONG,
+                x0=center_x,
+                y0=center_y,
+                p0=radius,
+                p1=light[0],
+                p2=light[1],
+                clip_x=light[2],
+                clip_y=rim,
+                opacity=iridescence,
+                color=color,
+            )
+        )
+    elif level == 16:
+        center_x, center_y = W / 2, H / 2
+        half_size = rng2.uniform(9, 18) / 2
+        light = _rand_light(rng2)
+        color = rng2.uniform(0.1, 1.0, C)
+        front = color * _phong(0, 0, 1, light)
+        top = color * _phong(0, -1, 0, light) * 0.75
+        left = color * _phong(-1, 0, 0, light) * 0.55
+        bounds = (
+            center_x - half_size,
+            center_y - half_size,
+            center_x + half_size,
+            center_y + half_size,
+        )
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.RECT,
+                x0=bounds[0],
+                y0=bounds[1],
+                p0=bounds[2],
+                p1=bounds[3],
+                color=front,
+            )
+        )
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.MAX_RECT,
+                x0=bounds[0],
+                y0=bounds[1],
+                p0=bounds[2],
+                p1=center_y,
+                color=top,
+            )
+        )
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.MAX_RECT,
+                x0=bounds[0],
+                y0=bounds[1],
+                p0=center_x,
+                p1=bounds[3],
+                color=left,
+            )
+        )
+    elif level == 17:
+        center_x = rng2.randint(6, W - 6)
+        center_y = rng2.randint(8, H - 8)
+        radius = rng2.uniform(4, 10)
+        light = _rand_light(rng2)
+        color = rng2.uniform(0.1, 1.0, C)
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.CYLINDER_PHONG,
+                x0=center_x,
+                y0=center_y,
+                p0=radius,
+                p1=light[0],
+                p2=light[1],
+                clip_x=light[2],
+                color=color,
+            )
+        )
+        top_y = int(center_y - radius * 1.5 * 0.7)
+        if top_y > 2:
+            top_color = color * _phong(0, 0, 1, light)
+            commands.append(
+                _primitive_command(
+                    PrimitiveOp.MAX_ELLIPSE,
+                    x0=center_x,
+                    y0=top_y,
+                    p0=radius,
+                    p1=radius,
+                    color=top_color,
+                )
+            )
+    elif level == 18:
+        center_x = rng2.randint(10, W - 10)
+        center_y = rng2.randint(10, H - 10)
+        radius = rng2.uniform(6, 10)
+        minor_radius = radius * rng2.uniform(0.25, 0.45)
+        light = _rand_light(rng2)
+        color = _primitive_material_color(
+            rng2.uniform(0.1, 1.0, C), material
+        )
+        _subject_gain, rim, iridescence, _light_color = material
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.TORUS_PHONG,
+                x0=center_x,
+                y0=center_y,
+                p0=radius,
+                p1=minor_radius / radius,
+                p2=light[0],
+                clip_x=light[1],
+                clip_y=light[2],
+                opacity=rim,
+                color=color,
+                extras=(iridescence, 0, 0, 0),
+            )
+        )
+    else:
+        raise ValueError(f"level {level} is not an analytic primitive plan")
+    return initial, np.stack(commands), rng2
+
+
+def _prepare_food_primitive_plan(idx, step):
+    """Compile level 142 soft-disc food and garnish composition."""
+    initial, rng2, _hi_key, _material = _prepare_primitive_preamble(
+        idx, 142, step
+    )
+    table = np.array(
+        [
+            rng2.uniform(0.2, 0.6),
+            rng2.uniform(0.12, 0.4),
+            rng2.uniform(0.05, 0.2),
+        ]
+    )
+    initial[:] = table
+    texture = _perlin(rng2, 2)
+    initial[:, :, :] += texture.reshape(H, W, 1) * 0.06
+    plate_x, plate_y = W / 2, H / 2 + rng2.uniform(-2, 3)
+    plate_radius = rng2.uniform(8, 12)
+    plate_color = np.ones(3) * rng2.uniform(0.6, 0.95)
+    alpha = _soft_disc(plate_x, plate_y, plate_radius)
+    for channel in range(C):
+        initial[:, :, channel] = np.clip(
+            initial[:, :, channel] * (1 - alpha)
+            + plate_color[channel] * alpha,
+            0,
+            1,
+        )
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    rim = (
+        np.clip(
+            (
+                plate_radius
+                - 0.8
+                - np.sqrt((yy - plate_y) ** 2 + (xx - plate_x) ** 2)
+            )
+            * 1.5,
+            0,
+            1,
+        )
+        * 0.15
+    )
+    for channel in range(C):
+        initial[:, :, channel] = np.clip(
+            initial[:, :, channel] - rim, 0, 1
+        )
+
+    commands = []
+    for _ in range(rng2.randint(2, 6)):
+        food_x = plate_x + rng2.uniform(
+            -plate_radius * 0.55, plate_radius * 0.55
+        )
+        food_y = plate_y + rng2.uniform(
+            -plate_radius * 0.45, plate_radius * 0.45
+        )
+        food_radius = rng2.uniform(1.5, 5)
+        food_color = np.array(
+            [
+                rng2.uniform(0.3, 0.9),
+                rng2.uniform(0.1, 0.7),
+                rng2.uniform(0.0, 0.3),
+            ]
+        )
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.SOFT_DISC,
+                x0=food_x,
+                y0=food_y,
+                p0=food_radius,
+                opacity=0.7,
+                color=food_color,
+            )
+        )
+    for _ in range(rng2.randint(0, 5)):
+        garnish_x = plate_x + rng2.uniform(
+            -plate_radius * 0.5, plate_radius * 0.5
+        )
+        garnish_y = plate_y + rng2.uniform(
+            -plate_radius * 0.4, plate_radius * 0.4
+        )
+        garnish_color = np.array(
+            [
+                rng2.uniform(0.0, 0.3),
+                rng2.uniform(0.4, 0.9),
+                rng2.uniform(0.0, 0.3),
+            ]
+        )
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.ADDITIVE_SOFT_DISC,
+                x0=garnish_x,
+                y0=garnish_y,
+                p0=rng2.uniform(0.3, 0.9),
+                opacity=0.6,
+                color=garnish_color,
+            )
+        )
+    return initial, np.stack(commands), rng2
+
+
+def _prepare_crowd_primitive_plan(idx, step):
+    """Compile level 144 heads and bodies into soft-disc/affine commands."""
+    initial, rng2, hi_key, _material = _prepare_primitive_preamble(
+        idx, 144, step
+    )
+    _rand_light(rng2)
+    horizon = rng2.randint(10, 24)
+    _ground(rng2, initial, horizon, None, hi_key)
+    if rng2.rand() < 0.5:
+        sky = np.array(
+            [
+                rng2.uniform(0.3, 0.6),
+                rng2.uniform(0.35, 0.65),
+                rng2.uniform(0.45, 0.8),
+            ]
+        )
+        for row in range(H):
+            amount = min(
+                1.0, max(0.0, (row - horizon) / max(H - horizon, 1))
+            )
+            initial[row, :] = np.clip(
+                initial[row, :] * 0.3 + sky * (1 - amount) * 0.7,
+                0,
+                1,
+            )
+    count = rng2.randint(8, 26)
+    cluster_count = rng2.randint(1, 3)
+    centers = [
+        rng2.uniform(W * 0.15, W * 0.85)
+        for _ in range(cluster_count)
+    ]
+    commands = []
+    for _ in range(count):
+        body_x = np.clip(
+            rng2.choice(centers) + rng2.uniform(-W * 0.22, W * 0.22),
+            1,
+            W - 1,
+        )
+        body_y = rng2.uniform(horizon + 1, H - 1)
+        depth = (body_y - horizon) / max(H - horizon, 1)
+        size = rng2.uniform(1.8, 4.5) * (0.45 + 0.55 * depth)
+        color = _photo_color(rng2, 0.05, 0.85)
+        head_y = body_y - size * 0.35
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.SOFT_DISC,
+                x0=body_x,
+                y0=head_y,
+                p0=size * 0.28,
+                opacity=0.85,
+                color=color,
+            )
+        )
+        body_y0 = int(head_y + size * 0.15)
+        body_y1 = int(body_y + size * 0.3)
+        for row in range(max(0, body_y0), min(H, body_y1 + 1)):
+            width = size * 0.22 * (
+                1
+                - abs(row - (body_y0 + body_y1) / 2)
+                / max(body_y1 - body_y0, 1)
+                * 0.8
+            )
+            x0 = int(np.clip(body_x - width, 0, W))
+            x1 = int(np.clip(body_x + width, 0, W))
+            commands.append(
+                _primitive_command(
+                    PrimitiveOp.AFFINE_RECT,
+                    x0=x0,
+                    y0=row,
+                    p0=x1 - 1,
+                    p1=row,
+                    opacity=0.2,
+                    color=color * 0.85,
+                )
+            )
+    return initial, np.stack(commands), rng2
+
+
+def _prepare_pore_plan(idx, step):
+    """Compile level 128 into the shared ordered primitive IR."""
+    initial, rng2, _hi_key, _material = _prepare_primitive_preamble(
+        idx, 128, step
+    )
+
+    base = _photo_color(rng2, 0.25, 0.75)
+    hi_head, lo_head = (1.0 - base).min(), (base - 0.02).min()
+    wobble = min(0.15, 2 * hi_head, 2 * lo_head)
+    initial[:] = (
+        base
+        + (_perlin(rng2, 4).reshape(H, W, 1) - 0.5) * wobble
+    )
+    bump = rng2.rand() < 0.5
+    headroom = hi_head if bump else lo_head
+    n_pores = rng2.randint(4, 140)
+    placed = []
+    attempts = 0
+    while len(placed) < n_pores and attempts < n_pores * 15:
+        attempts += 1
+        radius = rng2.uniform(0.6, 4.5)
+        cx, cy = rng2.uniform(0, W), rng2.uniform(0, H)
+        if any(
+            math.hypot(cx - px, cy - py) < (radius + pr) * 0.55
+            for px, py, pr in placed
+        ):
+            continue
+        placed.append((cx, cy, radius))
+
+    commands = []
+    for cx, cy, radius in placed:
+        delta = min(rng2.uniform(0.2, 0.4), headroom) * (
+            1 if bump else -1
+        )
+        shade = base + delta
+        alpha_scale = rng2.uniform(0.6, 1.0)
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.SOFT_DISC,
+                x0=cx,
+                y0=cy,
+                p0=radius,
+                opacity=alpha_scale,
+                color=shade,
+            )
+        )
+        rim_color = base - delta * 0.5
+        commands.append(
+            _primitive_command(
+                PrimitiveOp.SOFT_RING,
+                x0=cx,
+                y0=cy,
+                p0=radius,
+                p1=radius * 0.6,
+                opacity=0.5,
+                color=rim_color,
+            )
+        )
+        if radius > 1.1 and rng2.rand() < 0.35:
+            content_radius = radius * rng2.uniform(0.12, 0.3)
+            ring_width = content_radius * rng2.uniform(0.25, 0.45)
+            max_offset = max(
+                0.0, radius * 0.58 - content_radius - ring_width
+            )
+            offset_angle = rng2.uniform(0, 2 * math.pi)
+            offset_magnitude = rng2.uniform(0, max_offset)
+            content_x = cx + math.cos(offset_angle) * offset_magnitude
+            content_y = cy + math.sin(offset_angle) * offset_magnitude
+            commands.append(
+                _primitive_command(
+                    PrimitiveOp.CLIPPED_SOFT_RING,
+                    x0=content_x,
+                    y0=content_y,
+                    p0=content_radius + ring_width,
+                    p1=content_radius,
+                    clip_x=cx,
+                    clip_y=cy,
+                    clip_radius=radius,
+                    color=base * 0.15,
+                )
+            )
+            content_color = rng2.uniform(0.05, 1.0, C)
+            commands.append(
+                _primitive_command(
+                    PrimitiveOp.CLIPPED_SOFT_DISC,
+                    x0=content_x,
+                    y0=content_y,
+                    p0=content_radius,
+                    clip_x=cx,
+                    clip_y=cy,
+                    clip_radius=radius,
+                    color=content_color,
+                )
+            )
+    return initial, np.stack(commands), rng2
+
+
+def _prepare_primitive_plan(idx, level, step):
+    if level == 128:
+        return _prepare_pore_plan(idx, step)
+    if level == 142:
+        return _prepare_food_primitive_plan(idx, step)
+    if level == 144:
+        return _prepare_crowd_primitive_plan(idx, step)
+    if level in {4, 6, 15, 16, 17, 18}:
+        return _prepare_geometry_primitive_plan(idx, level, step)
+    return _prepare_discrete_primitive_plan(idx, level, step)
+
+
+def _prepare_primitive_plan_task(arguments):
+    """Picklable Primitive IR compiler entry point."""
+    return _prepare_primitive_plan(*arguments)
+
+
+def _finish_portable_primitive_batch(
+    batch_indices,
+    prepared,
+    *,
+    force_level,
+    raster,
+    executor=None,
+    chunksize=32,
+):
+    """Execute Primitive IR on GPU and preserve the legacy CPU post pipeline."""
+    from ._webgpu import render_primitive_images
+
+    initial = np.stack([item[0] for item in prepared])
+    command_lists = [item[1] for item in prepared]
+    rendered = render_primitive_images(initial, command_lists)
+    tasks = (
+        (idx, image, item[2], force_level, raster)
+        for idx, image, item in zip(batch_indices, rendered, prepared)
+    )
+    if executor is not None:
+        images = executor.map(
+            _finish_primitive_item_task, tasks, chunksize=chunksize
+        )
+    else:
+        images = map(_finish_primitive_item_task, tasks)
+    return _collect_batch(images, len(batch_indices))
+
+
+def _finish_primitive_item_task(arguments):
+    """Finish one Primitive IR image; safe to run in a CPU worker."""
+    idx, image, rng2, force_level, raster = arguments
+    level = int(force_level) if force_level is not None else _level_of(idx)
+    if level >= 82 and rng2.randint(0, 2) == 0:
+        image = np.ascontiguousarray(image[:, ::-1])
+    if level not in POST_LEVELS:
+        if rng2.randint(0, 3) > 0:
+            image = _natural_color(image, rng2)
+        if rng2.randint(0, 7) == 0:
+            image = _poisson(image, rng2)
+        if rng2.randint(0, 3) == 0:
+            image = gaussian_filter(
+                image, sigma=(rng2.uniform(0.3, 0.7),) * 2 + (0,)
+            )
+    image = _apply_scene(
+        np.clip(image, 0, 1).astype(np.float32), _scene(idx)
+    )
+    if raster is not None:
+        source = (
+            _indexed_rgba(image, idx, force_level, raster)
+            if _raster_requests_alpha(raster)
+            else image
+        )
+        image = convert_raster(source, raster)
+    return image
+
+
+def _webgpu_is_measurably_faster(
+    batch_indices,
+    levels,
+    *,
+    family,
+    step,
+    force_level,
+    workers,
+    chunksize,
+    start_method,
+    enabled_families=None,
+    shared_executor=None,
+):
+    """Calibrate auto-selection once per adapter, worker count, and batch scale."""
+    from ._webgpu import accelerator_info, render_wave_images
+
+    # Large heterogeneous batches can scale differently once command buffers,
+    # CPU plans, and readbacks all grow. Calibrate up to one full 4K bulk
+    # dispatch rather than extrapolating a small prefix.
+    sample_count = min(len(batch_indices), 4096)
+    # Keep independent decisions for small and large dispatches without
+    # generating an unbounded cache of exact batch lengths.
+    scale = 1 << max(0, sample_count.bit_length() - 1)
+    key = (
+        os.environ.get("SIG_WEBGPU_ADAPTER", "").strip().casefold(),
+        family,
+        int(workers),
+        scale,
+    )
+    with _AUTO_WEBGPU_LOCK:
+        cached = _AUTO_WEBGPU_RESULTS.get(key)
+        if cached is not None:
+            return bool(cached["enabled"])
+
+        if sample_count == len(batch_indices):
+            sample_positions = np.arange(sample_count)
+        else:
+            sample_positions = np.linspace(
+                0, len(batch_indices) - 1, sample_count, dtype=np.int64
+            )
+        sample_indices = [
+            batch_indices[int(position)] for position in sample_positions
+        ]
+        sample_levels = [levels[int(position)] for position in sample_positions]
+        # Initialize the shared Sobol table before timing either backend.
+        make_image(sample_indices[0])
+        cpu_backend = "process" if workers > 1 and sample_count >= 64 else "serial"
+        started = time.perf_counter()
+        if cpu_backend == "process" and shared_executor is not None:
+            reference = _collect_batch(
+                shared_executor.map(
+                    _make_image_task,
+                    (
+                        (idx, step, force_level, None)
+                        for idx in sample_indices
+                    ),
+                    chunksize=chunksize,
+                ),
+                sample_count,
+            )
+        else:
+            reference = make_images(
+                sample_indices,
+                step=step,
+                force_level=force_level,
+                backend=cpu_backend,
+                workers=workers,
+                chunksize=chunksize,
+                start_method=start_method,
+                fidelity="legacy",
+            )
+        cpu_seconds = time.perf_counter() - started
+
+        # Enumerate adapters only after the process-based CPU reference has
+        # completed. Native GPU runtimes may start helper threads, after which
+        # safely forking a CPU pool is no longer possible.
+        info = accelerator_info()
+        if not info["available"]:
+            _AUTO_WEBGPU_RESULTS[key] = {
+                "enabled": False,
+                "reason": info.get("reason", "accelerator unavailable"),
+                "cpu_seconds": cpu_seconds,
+                "samples": sample_count,
+            }
+            return False
+
+        # Adapter creation and shader compilation are cached setup costs, not
+        # steady-state throughput. A tiny warm-up also validates the driver.
+        warm_count = min(8, sample_count)
+        families = (
+            set(family.split("+"))
+            if enabled_families is None
+            else set(enabled_families)
+        )
+        sample_gpu_families = {
+            GPU_LEVEL_FAMILIES[level]
+            for level in sample_levels
+            if level in GPU_LEVEL_FAMILIES
+            and GPU_LEVEL_FAMILIES[level] in families
+        }
+        all_sample_gpu = len(sample_gpu_families) > 0 and all(
+            level in GPU_LEVEL_FAMILIES
+            and GPU_LEVEL_FAMILIES[level] in families
+            for level in sample_levels
+        )
+        if all_sample_gpu and sample_gpu_families == {"wave"}:
+            render_wave_images(
+                sample_indices[:warm_count], sample_levels[:warm_count]
+            )
+        elif all_sample_gpu and sample_gpu_families == {"reaction_diffusion"}:
+            _portable_reaction_batch(
+                sample_indices[:warm_count],
+                step=step,
+                force_level=force_level,
+                raster=None,
+            )
+        else:
+            warm_indices = []
+            for selected_family in sorted(sample_gpu_families):
+                warm_indices.extend(
+                    [
+                        idx
+                        for idx, level in zip(sample_indices, sample_levels)
+                        if GPU_LEVEL_FAMILIES.get(level) == selected_family
+                    ][:warm_count]
+                )
+            _portable_webgpu_batch(
+                warm_indices,
+                step=step,
+                force_level=force_level,
+                raster=None,
+                workers=workers,
+                chunksize=chunksize,
+                start_method=start_method,
+                enabled_families=families,
+                shared_executor=shared_executor,
+            )
+        started = time.perf_counter()
+        if all_sample_gpu and sample_gpu_families == {"wave"}:
+            candidate = render_wave_images(sample_indices, sample_levels)
+        elif all_sample_gpu and sample_gpu_families == {"reaction_diffusion"}:
+            candidate = _portable_reaction_batch(
+                sample_indices,
+                step=step,
+                force_level=force_level,
+                raster=None,
+            )
+        else:
+            candidate = _portable_webgpu_batch(
+                sample_indices,
+                step=step,
+                force_level=force_level,
+                raster=None,
+                workers=workers,
+                chunksize=chunksize,
+                start_method=start_method,
+                enabled_families=families,
+                shared_executor=shared_executor,
+            )
+        gpu_seconds = time.perf_counter() - started
+        maximum_error = float(np.max(np.abs(reference - candidate)))
+        absolute_error = np.abs(reference - candidate)
+        if sample_gpu_families & {"reaction_diffusion", "primitive_ir"}:
+            # A field or blend value infinitesimally crossing a downstream
+            # stochastic/threshold boundary can change a few final pixels by
+            # much more than the underlying arithmetic error. Validate the
+            # distribution as well as the ordinary numerical path.
+            numerically_valid = bool(
+                float(absolute_error.mean()) <= 1e-5
+                and float(np.percentile(absolute_error, 99.0)) <= 1e-4
+            )
+        else:
+            numerically_valid = bool(
+                np.allclose(reference, candidate, rtol=1e-4, atol=1e-4)
+            )
+        speedup = cpu_seconds / max(gpu_seconds, 1e-12)
+        enabled = numerically_valid and speedup >= 1.10
+        _AUTO_WEBGPU_RESULTS[key] = {
+            "enabled": enabled,
+            "speedup": speedup,
+            "cpu_seconds": cpu_seconds,
+            "webgpu_seconds": gpu_seconds,
+            "max_abs_error": maximum_error,
+            "samples": sample_count,
+        }
+        return enabled
+
+
+def make_images(
+    indices: Iterable[int],
+    *,
+    step: int = 7,
+    force_level: int | None = None,
+    raster: RasterSpec | None = None,
+    backend: str = "auto",
+    workers: int | None = None,
+    chunksize: int | None = None,
+    start_method: str = "auto",
+    fidelity: str = "legacy",
+) -> np.ndarray:
+    """Generate a deterministic batch using CPU or portable WebGPU.
+
+    ``backend="auto"`` keeps small batches serial. With ``workers=None`` and a
+    sufficiently large batch it measures physical/SMT process counts, native
+    thread policy, and (when ``chunksize=None``) chunk size against the actual
+    workload, then reuses a warmed pool. The process backend preserves output
+    order and isolates the legacy renderer's mutable recursive state.
+
+    ``fidelity="legacy"`` is the default byte-exact contract and never selects
+    GPU arithmetic automatically. ``fidelity="portable"`` permits small
+    cross-device floating-point differences and lets ``auto`` select measured
+    WebGPU families only when both their local and whole-batch gates beat the
+    tuned CPU. The explicit ``webgpu`` backend requires portable fidelity and
+    falls back to CPU for levels without a portable kernel.
+    """
+    try:
+        batch_indices = [_validated_index(idx) for idx in indices]
+    except TypeError as error:
+        if isinstance(indices, (str, bytes)) or not hasattr(indices, "__iter__"):
+            raise TypeError("indices must be an iterable of integers") from error
+        raise
+    step = _validated_step(step)
+    force_level = _validated_force_level(force_level)
+    if raster is not None:
+        _validated_raster_spec(raster)
+    if not isinstance(backend, str) or backend.lower() not in BATCH_BACKENDS:
+        choices = ", ".join(BATCH_BACKENDS)
+        raise ValueError(f"backend must be one of: {choices}")
+    backend = backend.lower()
+    if (
+        not isinstance(fidelity, str)
+        or fidelity.lower() not in BATCH_FIDELITIES
+    ):
+        choices = ", ".join(BATCH_FIDELITIES)
+        raise ValueError(f"fidelity must be one of: {choices}")
+    fidelity = fidelity.lower()
+    if backend == "webgpu" and fidelity != "portable":
+        raise ValueError(
+            "backend='webgpu' requires fidelity='portable' because GPU "
+            "transcendentals are not byte-identical across devices"
+        )
+    supported_start_methods = set(multiprocessing.get_all_start_methods())
+    if (
+        not isinstance(start_method, str)
+        or (
+            start_method.lower() != "auto"
+            and start_method.lower() not in supported_start_methods
+        )
+    ):
+        choices = ", ".join(["auto", *sorted(supported_start_methods)])
+        raise ValueError(f"start_method must be one of: {choices}")
+    start_method = start_method.lower()
+    if chunksize is not None:
+        if (
+            isinstance(chunksize, (bool, np.bool_))
+            or not isinstance(chunksize, (int, np.integer))
+            or int(chunksize) < 1
+        ):
+            raise ValueError("chunksize must be a positive integer or None")
+        chunksize = int(chunksize)
+    if workers is not None:
+        if (
+            isinstance(workers, (bool, np.bool_))
+            or not isinstance(workers, (int, np.integer))
+            or int(workers) < 1
+        ):
+            raise ValueError("workers must be a positive integer or None")
+        workers = int(workers)
+    if not batch_indices:
+        return _empty_batch(raster)
+
+    in_daemon = multiprocessing.current_process().daemon
+    batch_levels = [
+        (
+            int(force_level)
+            if force_level is not None
+            else _level_of(idx)
+        )
+        for idx in batch_indices
+    ]
+    selected_cpu_executor = None
+    if workers is None and backend in {"auto", "process"}:
+        (
+            selected_workers,
+            selected_chunksize,
+            limit_native_threads,
+        ) = _select_cpu_configuration(
+            batch_indices,
+            batch_levels,
+            step=step,
+            force_level=force_level,
+            raster=raster,
+            requested_chunksize=chunksize,
+            start_method=start_method,
+        )
+        if (
+            len(batch_indices) >= 64
+            and selected_workers > 1
+            and not in_daemon
+        ):
+            selected_cpu_executor = _auto_cpu_executor(
+                selected_workers,
+                start_method,
+                limit_native_threads=limit_native_threads,
+            )
+    else:
+        topology = _cpu_topology()
+        selected_workers = (
+            min(len(batch_indices), topology["physical_cores"])
+            if workers is None
+            else workers
+        )
+        selected_chunksize = (
+            _recommended_chunksize(
+                len(batch_indices), selected_workers
+            )
+            if chunksize is None
+            else chunksize
+        )
+    chunksize = selected_chunksize
+    auto_gpu_families = None
+    auto_shared_executor = selected_cpu_executor
+    if backend == "auto":
+        family_positions = {}
+        for position, level in enumerate(batch_levels):
+            family = GPU_LEVEL_FAMILIES.get(level)
+            if family is not None:
+                family_positions.setdefault(family, []).append(position)
+        enabled_families = set()
+        if (
+            fidelity == "portable"
+            and raster is None
+            and family_positions
+        ):
+            if (
+                len(batch_indices) >= _AUTO_WEBGPU_MIN_IMAGES
+                and selected_workers > 1
+                and not in_daemon
+            ):
+                if auto_shared_executor is None:
+                    auto_shared_executor = _auto_cpu_executor(
+                        selected_workers, start_method
+                    )
+            for family, positions in sorted(family_positions.items()):
+                if len(positions) < _AUTO_WEBGPU_MIN_IMAGES:
+                    continue
+                family_indices = [
+                    batch_indices[position] for position in positions
+                ]
+                family_levels = [batch_levels[position] for position in positions]
+                try:
+                    if _webgpu_is_measurably_faster(
+                        family_indices,
+                        family_levels,
+                        family=family,
+                        step=step,
+                        force_level=force_level,
+                        workers=selected_workers,
+                        chunksize=chunksize,
+                        start_method=start_method,
+                        shared_executor=auto_shared_executor,
+                    ):
+                        enabled_families.add(family)
+                # Auto must remain a safe CPU fallback even when a driver
+                # reports validation, device-loss, or allocation failure.
+                # Explicit backend='webgpu' still surfaces the original error.
+                except Exception:
+                    continue
+            if enabled_families:
+                gpu_positions = sum(
+                    len(family_positions[family])
+                    for family in enabled_families
+                )
+                needs_hybrid_gate = (
+                    len(enabled_families) > 1
+                    or gpu_positions != len(batch_indices)
+                )
+                if needs_hybrid_gate:
+                    hybrid_key = "hybrid:" + "+".join(
+                        sorted(enabled_families)
+                    )
+                    try:
+                        hybrid_enabled = _webgpu_is_measurably_faster(
+                            batch_indices,
+                            batch_levels,
+                            family=hybrid_key,
+                            step=step,
+                            force_level=force_level,
+                            workers=selected_workers,
+                            chunksize=chunksize,
+                            start_method=start_method,
+                            enabled_families=enabled_families,
+                            shared_executor=auto_shared_executor,
+                        )
+                    except Exception:
+                        hybrid_enabled = False
+                    if not hybrid_enabled:
+                        enabled_families.clear()
+        if enabled_families:
+            auto_gpu_families = enabled_families
+            backend = "webgpu"
+        else:
+            backend = (
+                "process"
+                if len(batch_indices) >= 64
+                and selected_workers > 1
+                and not in_daemon
+                else "serial"
+            )
+    if backend == "webgpu":
+        return _portable_webgpu_batch(
+            batch_indices,
+            step=step,
+            force_level=force_level,
+            raster=raster,
+            workers=workers,
+            chunksize=chunksize,
+            start_method=start_method,
+            enabled_families=auto_gpu_families,
+            shared_executor=auto_shared_executor,
+        )
+    if backend == "process" and in_daemon:
+        raise RuntimeError(
+            "the process backend cannot run inside a daemon process; "
+            "use backend='serial' or let the parent process own the batch pool"
+        )
+    if backend == "serial" or selected_workers == 1:
+        images = (
+            make_image(
+                idx, step=step, force_level=force_level, raster=raster
+            )
+            for idx in batch_indices
+        )
+        return _collect_batch(images, len(batch_indices))
+    elif auto_shared_executor is not None:
+        images = auto_shared_executor.map(
+            _make_image_task,
+            (
+                (idx, step, force_level, raster)
+                for idx in batch_indices
+            ),
+            chunksize=chunksize,
+        )
+        return _collect_batch(images, len(batch_indices))
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+
+        tasks = (
+            (idx, step, force_level, raster) for idx in batch_indices
+        )
+        # Fork is substantially cheaper for this SciPy-heavy package, but only
+        # use it from a single-threaded Linux parent. Otherwise spawn avoids
+        # copying locks or third-party worker threads into the renderer.
+        if start_method == "auto":
+            safe_to_fork = (
+                sys.platform.startswith("linux") and threading.active_count() == 1
+            )
+            selected_start_method = "fork" if safe_to_fork else "spawn"
+        else:
+            selected_start_method = start_method
+        process_context = multiprocessing.get_context(selected_start_method)
+        with ProcessPoolExecutor(
+            max_workers=selected_workers,
+            mp_context=process_context,
+            initializer=_cpu_worker_init,
+        ) as executor:
+            images = executor.map(_make_image_task, tasks, chunksize=chunksize)
+            return _collect_batch(images, len(batch_indices))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4796,6 +7127,11 @@ def _validated_raster_spec(spec: RasterSpec):
         raise ValueError("bits_per_channel values must be between 1 and 16")
     if mode == "binary" and bits != (1,):
         raise ValueError("binary output requires bits_per_channel=1")
+    if mode == "grayscale" and packed:
+        raise ValueError(
+            "packed grayscale output is not supported; use mode='binary' "
+            "for one-bit packed pixels"
+        )
     return mode, bits, spec.resize.lower(), spec.dither.lower(), packed
 
 
@@ -4861,16 +7197,20 @@ def extract_alpha(image, alpha_mode="background", level=None):
     ``auto`` removes the background only for object/sprite-oriented indexed
     levels. Full-frame procedural and scene levels remain opaque.
     """
-    rgb = np.asarray(image)
-    if rgb.ndim != 3 or rgb.shape[2] not in (3, 4):
+    source = np.asarray(image)
+    if source.ndim != 3 or source.shape[2] not in (3, 4):
         raise ValueError("extract_alpha expects an H×W×3 RGB or H×W×4 RGBA array")
     mode = str(alpha_mode).lower()
     if mode not in _RASTER_ALPHA_MODES:
         raise ValueError("alpha_mode must be auto, opaque, background, or luminance")
+    if np.issubdtype(source.dtype, np.integer):
+        scale = float(np.iinfo(source.dtype).max)
+        rgb = source.astype(np.float32) / scale
+    else:
+        rgb = source.astype(np.float32, copy=False)
+    rgb = np.clip(rgb, 0, 1)
     if rgb.shape[2] == 4:
-        alpha = rgb[:, :, 3].astype(np.float32)
-        if np.issubdtype(rgb.dtype, np.integer):
-            alpha /= np.iinfo(rgb.dtype).max
+        alpha = rgb[:, :, 3]
         return np.clip(alpha, 0, 1)
     if mode == "opaque" or (
         mode == "auto" and (level is None or int(level) not in _INDEXED_SPRITE_LEVELS)
@@ -4887,6 +7227,22 @@ def _indexed_rgba(image, idx, force_level, raster):
     return np.concatenate([image, alpha[:, :, None]], axis=2).astype(np.float32)
 
 
+@lru_cache(maxsize=32)
+def _resize_coordinates(source_h, source_w, height, width):
+    target_y = (
+        np.array([(source_h - 1) * 0.5], np.float32)
+        if height == 1 else np.linspace(0, source_h - 1, height, dtype=np.float32)
+    )
+    target_x = (
+        np.array([(source_w - 1) * 0.5], np.float32)
+        if width == 1 else np.linspace(0, source_w - 1, width, dtype=np.float32)
+    )
+    yy, xx = np.meshgrid(target_y, target_x, indexing="ij")
+    yy.setflags(write=False)
+    xx.setflags(write=False)
+    return yy, xx
+
+
 def _resize_float_image(image, width, height, resize):
     """Resize an RGB float image to exactly ``height × width`` before quantizing."""
     source_h, source_w = image.shape[:2]
@@ -4899,15 +7255,7 @@ def _resize_float_image(image, width, height, resize):
         sigma_x = max(0.0, 0.5 * (source_w / width - 1.0))
         if sigma_x or sigma_y:
             working = gaussian_filter(image, sigma=(sigma_y, sigma_x, 0))
-    target_y = (
-        np.array([(source_h - 1) * 0.5], np.float32)
-        if height == 1 else np.linspace(0, source_h - 1, height, dtype=np.float32)
-    )
-    target_x = (
-        np.array([(source_w - 1) * 0.5], np.float32)
-        if width == 1 else np.linspace(0, source_w - 1, width, dtype=np.float32)
-    )
-    yy, xx = np.meshgrid(target_y, target_x, indexing="ij")
+    yy, xx = _resize_coordinates(source_h, source_w, height, width)
     result = np.empty((height, width, working.shape[2]), np.float32)
     for channel in range(working.shape[2]):
         result[:, :, channel] = map_coordinates(
@@ -4917,6 +7265,7 @@ def _resize_float_image(image, width, height, resize):
     return np.clip(result, 0, 1)
 
 
+@lru_cache(maxsize=32)
 def _ordered_offsets(height, width):
     bayer = np.array(
         [
@@ -4928,7 +7277,9 @@ def _ordered_offsets(height, width):
         np.float32,
     )
     tiled = np.tile(bayer, (math.ceil(height / 4), math.ceil(width / 4)))
-    return (tiled[:height, :width] + 0.5) / 16.0 - 0.5
+    offsets = (tiled[:height, :width] + 0.5) / 16.0 - 0.5
+    offsets.setflags(write=False)
+    return offsets
 
 
 def _quantize_float_channels(values, levels, dither):
@@ -5489,7 +7840,62 @@ def _apply_post_alpha(alpha, post):
     return np.clip(alpha, 0, 1).astype(np.float32)
 
 
-def make_scene(
+def _validated_scene_seed(seed):
+    if (
+        isinstance(seed, (bool, np.bool_))
+        or not isinstance(seed, (int, np.integer))
+    ):
+        raise TypeError("seed must be an integer")
+    seed = int(seed)
+    if not 0 <= seed <= np.iinfo(np.uint32).max:
+        raise ValueError("seed must be between 0 and 2**32 - 1")
+    return seed
+
+
+def _validate_scene_object(obj, active_ids):
+    if not isinstance(obj, ObjectSpec):
+        raise TypeError("SceneSpec.objects and children must contain ObjectSpec instances")
+    if not isinstance(obj.kind, str):
+        raise TypeError("ObjectSpec.kind must be a string")
+    if (
+        isinstance(obj.depth, (bool, np.bool_))
+        or not isinstance(obj.depth, (int, float, np.integer, np.floating))
+        or not np.isfinite(obj.depth)
+    ):
+        raise ValueError("ObjectSpec.depth must be a finite number")
+    if not isinstance(obj.children, (list, tuple)):
+        raise TypeError("ObjectSpec.children must be a list or tuple")
+    identity = id(obj)
+    if identity in active_ids:
+        raise ValueError("ObjectSpec.children cannot contain a reference cycle")
+    active_ids.add(identity)
+    try:
+        for child in obj.children:
+            _validate_scene_object(child, active_ids)
+    finally:
+        active_ids.remove(identity)
+
+
+def _validate_scene_spec(spec):
+    if not isinstance(spec, SceneSpec):
+        raise TypeError("spec must be a SceneSpec")
+    if not isinstance(spec.background, Background):
+        raise TypeError("SceneSpec.background must be a Background")
+    if not isinstance(spec.background.kind, str):
+        raise TypeError("Background.kind must be a string")
+    if not isinstance(spec.light, LightSpec):
+        raise TypeError("SceneSpec.light must be a LightSpec")
+    if not isinstance(spec.post, PostSpec):
+        raise TypeError("SceneSpec.post must be a PostSpec")
+    if spec.post.style is not None and not isinstance(spec.post.style, str):
+        raise TypeError("PostSpec.style must be a string or None")
+    if not isinstance(spec.objects, (list, tuple)):
+        raise TypeError("SceneSpec.objects must be a list or tuple")
+    for obj in spec.objects:
+        _validate_scene_object(obj, set())
+
+
+def _make_scene_unlocked(
     spec: SceneSpec,
     seed: int = 0,
     raster: RasterSpec | None = None,
@@ -5552,6 +7958,26 @@ def make_scene(
     return image if raster is None else convert_raster(image, raster)
 
 
+def make_scene(
+    spec: SceneSpec,
+    seed: int = 0,
+    raster: RasterSpec | None = None,
+) -> np.ndarray:
+    """Render one deterministic structured scene.
+
+    Objects are painted from far to near according to ``depth``. Randomized
+    defaults are local to ``seed``. Without ``raster`` the output is a
+    32×32×3 float32 RGB array; otherwise it follows the supplied RasterSpec.
+    Public calls are safe across concurrent threads.
+    """
+    _validate_scene_spec(spec)
+    seed = _validated_scene_seed(seed)
+    if raster is not None:
+        _validated_raster_spec(raster)
+    with _RENDER_LOCK:
+        return _make_scene_unlocked(spec, seed=seed, raster=raster)
+
+
 def make_scene_raster(
     spec: SceneSpec,
     raster: RasterSpec,
@@ -5566,42 +7992,11 @@ def make_scene_raster(
 # ═══════════════════════════════════════════════════════════════
 
 def _cli_demo():
-    """Render a 72×5 preview grid to disk."""
+    """Render a complete level preview grid to disk."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    names = [
-        "0:pts","1:pts+","2:lines","3:curves","4:fill","5:hollow","6:grad","7:2D+tex",
-        "8:edges","9:mono","10:analog","11:comple","12:triadic","13:warm","14:cool",
-        "15:sph","16:cube","17:cyl","18:torus","19:org3D","20:splat3D","21:multi3D",
-        "22:brushed","23:wood","24:marble","25:striated","26:depthFog","27:perspect",
-        "28:1/f+3D","29:sky+3D","30:shadow","31:softShadow","32:1D+2D+3D",
-        "33:full+edge","34:glass","35:blur","36:grain","37:1/f","38:perlin",
-        "39:geo","40:wire","41:edge","42:degrade","43:voronoi","44:patt",
-        "45:fogBlob","46:texGrain","47:chaos",
-        "48:2D_insect","49:2D_anim","50:2D_bird","51:2D_fish","52:2D_spider",
-        "53:3D_human","54:3D_quad","55:3D_bird","56:3D_fish","57:3D_abstract",
-        "58:texCreature","59:tree_rnd","60:tree_pine","61:tree_palm",
-        "62:bush+flwr","63:building","64:water","65:fire","66:gas","67:elemCombo",
-        "68:forest","69:urban","70:creat+env","71:CHAOS",
-        "72:raw","73:real","74:cartoon","75:sketch","76:waterclr","77:neon","78:vintage","79:pixel",
-        "80:captureAA","81:cropZoom","82:car","83:plane","84:ship","85:face","86:DOF","87:motion",
-        "88:natColor","89:exposure","90:silhouette","91:grass","92:fur","93:fractal","94:grid",
-        "95:clouds","96:weather","97:reflection","98:jpeg","99:coherent",
-        "100:tree3D","101:pine/palm3D","102:bush/flower3D","103:building3D","104:car3D",
-        "105:plane3D","106:ship3D","107:insect3D","108:spider3D","109:wire3D",
-        "110:texOnSurface","111:points3D",
-        "112:starfield","113:reactDiff","114:transmission","115:turbulence",
-        "116:lens/blackhole","117:hotMatter","118:nonOptical","119:coherent","120:closedLoop","121:text/glyphs","122:symbols+aug","123:singleGlyph",
-        "124:indoor","125:human","126:underwater","127:flowerField","128:poreTexture",
-        "129:mirror","130:kaleidoscope","131:xray","132:microscopy",
-        "133:diffract2D","134:diffract3D","135:refract2D","136:refract3D",
-        "137:hairStrands3D","138:weave3D",
-        "139:glass3D","140:caustics",
-        "141:aerial","142:food","143:mri",
-        "144:crowds","145:macro","146:sunset",
-    ]
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "levels_v8.png")
 
     N = N_LEVELS
@@ -5611,7 +8006,9 @@ def _cli_demo():
             idx = _level_start(li) + si * (SAMPLES_PER_LEVEL // 5)
             img = make_image(idx, 7)
             axes[li, si].imshow(img, vmin=0, vmax=1)
-            axes[li, si].set_title(f"{names[li]} {idx}", fontsize=3.8)
+            axes[li, si].set_title(
+                f"{li}:{LEVEL_NAMES[li]} {idx}", fontsize=3.8
+            )
             axes[li, si].axis("off")
     plt.suptitle(f"{N_LEVELS} levels — progressive visual generator", fontsize=12, y=0.995)
     plt.tight_layout()
