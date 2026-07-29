@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.22.0
+
+Phases 2-13 of the scene-graph/mini-game-engine roadmap (`SCENE_GRAPH_PLAN.md`),
+landed together as one increment following the module/versioning pattern
+established by 0.10.0. Every new module is a pure-data or pure-logic satellite
+(`generators/camera.py`, `layers.py`, `atlas.py`, `particles.py`, `physics.py`,
+`input_system.py`, `game_loop.py`, `ui.py`, `tween.py`, `tilemap.py`,
+`replay.py`, `web_export.py`) that either never imports the renderer or only
+calls the public `make_scene`/`make_scene_raster` functions exactly like any
+other caller — none of it can change `make_image` or existing `make_scene`
+output. Full suite (43 tests, including the byte-exact `make_image` regression
+test) passes unchanged.
+
+- **v0.11 — Camera & Viewport**: `CameraSpec`, `world_to_screen`/
+  `screen_to_world`, `aabb_in_view` for culling.
+- **v0.12 — Layers**: `Layer`/`LayerManager`, `SceneSpec.layers`, painter's-
+  order `sort_objects`, per-layer parallax rendering via the public
+  `make_scene` API.
+- **v0.13 — Sprites/Atlas**: `AtlasRegion`/`AtlasSpec`/`FlipbookClip`,
+  `stamp_sprite` (alpha-composites onto any RGBA canvas), `flipbook_region`.
+  `ObjectSpec` gains `sprite`/`texture_scale`/`flip_x`/`flip_y`/`flipbook`/
+  `frame`/`elapsed_ms` (all optional).
+- **v0.14 — Particles**: `ParticleEmitterSpec`/`ParticlePool` — deterministic
+  emission (caller-supplied `RandomState`), vectorized integration, disc
+  rendering onto an RGBA canvas.
+- **v0.15 — Physics**: `RigidBodySpec`/`PhysicsWorld` — semi-implicit Euler,
+  AABB/circle separation + impulse resolution, `Contact`/`ContactHandler`
+  enter/exit events, slab-method `ray_cast`. Game-physics fidelity, not
+  conservation-grade.
+- **v0.16 — Input**: `InputState`/`InputProvider` with `ReplayInputProvider`
+  (deterministic), `WebInputProvider` (externally-pushed events),
+  `NullInputProvider`, and an optional `PygameInputProvider` (lazy-imports
+  `pygame`; not a hard dependency).
+- **v0.17 — Game loop**: `GameClock` (fixed-timestep accumulator with a
+  spiral-of-death cap) and `SceneGraph`, which composes camera/physics/
+  particles/layers/clock and renders via the public `make_scene`.
+- **v0.18 — UI/HUD**: `WidgetSpec`/`HUD`, reusing the generator's existing
+  5x7 bitmap font (`_stamp_glyph`) for label text instead of a new font
+  system. Click events are edge-detected (press, not hold) and returned as
+  plain event-name strings — no embedded callbacks.
+- **v0.19 — Tweens**: `Tween`/`AnimationTrack` (linear/ease-in/ease-out/
+  ease-in-out/bounce/elastic easings, delay/loop/ping-pong) and
+  `Keyframe`/`KeyframeTrack`, resolving targets by name or tag via
+  `SceneQuery`.
+- **v0.20 — Tilemaps**: `TilemapSpec` (tile storage, `collision_mask`) and
+  `TilemapRenderer.render`, camera-culled numpy slice-and-stamp.
+- **v0.21 — Replay**: `FrameRecord`/`SessionRecorder`/`SessionPlayer` —
+  JSON-serializable input logs; replay determinism comes from the caller's
+  update logic being deterministic (no RNG inside `SceneGraph.update`).
+- **v0.22 — Web export**: `export_html` writes one self-contained HTML file
+  with objects drawn as flat-shaded 2D proxy shapes and a small inline JS
+  loop (arrow-key/WASD movement for `"player"`-tagged objects). This is an
+  interactive layout/interaction demo, not a JS port of the Phong-shaded 3D
+  renderer — use server-side `make_scene` frame sequences if pixel-identical
+  visuals are required.
+
+## 0.10.0
+
+- Added scene-graph object metadata: `ObjectSpec` gains `tags`, `layer`,
+  `visible`, `name`, and `collision_shape` fields (all optional, defaulted,
+  additive-only).
+- Added `BoundingBox` and `CollisionShape` to `generators.scene_spec`, and a
+  new `generators.scene_graph` module with `object_aabb`, `SceneQuery`
+  (`at_point`/`in_rect`/`tagged`/`named`), `check_collision`, and
+  `find_collisions` (AABB/CIRCLE pairs; CAPSULE deferred).
+- `scene_graph.py` only reads `ObjectSpec`/`SceneSpec` data and never imports
+  from the renderer, so it cannot affect `make_image` or `make_scene` output.
+  Verified: `make_image`'s byte-exact regression test is untouched, and a new
+  test proves `make_scene` renders identically whether or not the new
+  metadata fields are set on an object.
+- First phase of the scene-graph/mini-game-engine roadmap in
+  `SCENE_GRAPH_PLAN.md`; remaining phases (camera, layers, sprites,
+  particles, physics, input, game loop, UI, tweens, tilemaps, replay, web
+  export) follow in later versions.
+
 ## 0.9.0
 
 - Added Primitive Render IR v2 operations for rotated ellipses, ellipse

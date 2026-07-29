@@ -14,13 +14,44 @@ from .levels import (
     level_start,
 )
 from .scene_spec import (
+    AtlasRegion,
+    AtlasSpec,
     Background,
+    BoundingBox,
+    CollisionShape,
+    FlipbookClip,
+    Layer,
     LightSpec,
     ObjectSpec,
     PostSpec,
     RasterSpec,
     SceneSpec,
 )
+from .scene_graph import (
+    SceneQuery,
+    check_collision,
+    find_collisions,
+    object_aabb,
+)
+from .camera import CameraSpec, aabb_in_view, screen_to_world, world_to_screen
+from .layers import LayerManager
+from .atlas import flipbook_region, stamp_sprite
+from .particles import ParticleEmitterSpec, ParticlePool
+from .physics import Contact, ContactHandler, PhysicsWorld, RayCastHit, RigidBodySpec
+from .input_system import (
+    InputProvider,
+    InputState,
+    NullInputProvider,
+    PygameInputProvider,
+    ReplayInputProvider,
+    WebInputProvider,
+)
+from .game_loop import GameClock, SceneGraph
+from .ui import HUD, WidgetSpec
+from .tween import AnimationTrack, Keyframe, KeyframeTrack, Tween
+from .tilemap import TilemapRenderer, TilemapSpec
+from .replay import FrameRecord, SessionPlayer, SessionRecorder, serialize_objects
+from .web_export import export_html
 from .synthetic_image_generator import (
     BATCH_BACKENDS,
     BATCH_FIDELITIES,
@@ -42,13 +73,31 @@ from ._version import __version__
 from .wave import WAVE_LEVELS
 
 __all__ = [
+    "AnimationTrack",
+    "AtlasRegion",
+    "AtlasSpec",
     "Background",
     "BATCH_BACKENDS",
     "BATCH_FIDELITIES",
+    "BoundingBox",
     "C",
+    "CameraSpec",
+    "CollisionShape",
+    "Contact",
+    "ContactHandler",
+    "FlipbookClip",
+    "FrameRecord",
+    "GameClock",
     "GENERATOR_CONTRACT_VERSION",
     "GPU_LEVEL_FAMILIES",
     "H",
+    "HUD",
+    "InputProvider",
+    "InputState",
+    "Keyframe",
+    "KeyframeTrack",
+    "Layer",
+    "LayerManager",
     "LEGACY_LEVEL_SAMPLE_SHA256",
     "LEVEL_CYCLE_SIZE",
     "LEVEL_NAMES",
@@ -56,18 +105,40 @@ __all__ = [
     "LightSpec",
     "N_BLOCKS",
     "N_LEVELS",
+    "NullInputProvider",
     "ObjectSpec",
+    "ParticleEmitterSpec",
+    "ParticlePool",
+    "PhysicsWorld",
     "PostSpec",
+    "PygameInputProvider",
     "RasterSpec",
+    "RayCastHit",
+    "ReplayInputProvider",
+    "RigidBodySpec",
     "SAMPLES_PER_LEVEL",
+    "SceneGraph",
+    "SceneQuery",
     "SceneSpec",
+    "SessionPlayer",
+    "SessionRecorder",
+    "TilemapRenderer",
+    "TilemapSpec",
+    "Tween",
     "WAVE_LEVELS",
     "W",
+    "WebInputProvider",
+    "WidgetSpec",
     "__version__",
+    "aabb_in_view",
     "accelerator_info",
+    "check_collision",
     "cpu_info",
     "convert_raster",
+    "export_html",
     "extract_alpha",
+    "find_collisions",
+    "flipbook_region",
     "level_block",
     "level_of",
     "level_start",
@@ -76,4 +147,9 @@ __all__ = [
     "make_image_raster",
     "make_scene",
     "make_scene_raster",
+    "object_aabb",
+    "screen_to_world",
+    "serialize_objects",
+    "stamp_sprite",
+    "world_to_screen",
 ]
