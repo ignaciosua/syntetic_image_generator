@@ -1302,3 +1302,128 @@ def test_scene_catalog_and_trajectory_batches_are_ordered():
     traj_batch = sig.make_scene_trajectory_batch([0, 1], n_frames=3)
     assert [s.idx for s in traj_batch] == [0, 1]
     assert all(len(s.frames) == 3 for s in traj_batch)
+
+
+# ---------------------------------------------------------------------------
+# Physics lifecycle (gaps: remove_body, has_body, contact-handler dispatch,
+# on_collision_exit, ray-cast point/distance fields)
+# ---------------------------------------------------------------------------
+
+
+def test_physics_remove_body_and_has_body():
+    ground = sig.ObjectSpec(kind="box_3d", x=0, y=0, size=20, collision_shape=sig.CollisionShape.AABB)
+    ball = sig.ObjectSpec(kind="sphere_3d", x=0, y=5, radius=2, collision_shape=sig.CollisionShape.CIRCLE)
+    ground_body = sig.RigidBodySpec(is_static=True)
+    ball_body = sig.RigidBodySpec(mass=1.0)
+    world = sig.PhysicsWorld(gravity=(0, 0))
+
+    world.add_body(ground, ground_body)
+    world.add_body(ball, ball_body)
+    assert world.has_body(ground)
+    assert world.has_body(ball)
+    assert not world.has_body(sig.ObjectSpec(kind="sphere_3d"))
+
+    world.remove_body(ball_body)
+    assert not world.has_body(ball)
+    assert world.has_body(ground)
+
+    # removing an already-removed body is a no-op (no crash)
+    world.remove_body(ball_body)
+
+
+def test_physics_contact_handler_dispatch():
+    ground = sig.ObjectSpec(kind="box_3d", x=0, y=0, size=20, collision_shape=sig.CollisionShape.AABB)
+    ball = sig.ObjectSpec(kind="sphere_3d", x=0, y=10, radius=2, collision_shape=sig.CollisionShape.CIRCLE)
+    world = sig.PhysicsWorld(gravity=(0, 50))  # positive y = downward in render convention
+    world.add_body(ground, sig.RigidBodySpec(is_static=True))
+    world.add_body(ball, sig.RigidBodySpec(mass=1.0, restitution=0.0))
+
+    log: list[str] = []
+
+    class TestHandler:
+        def on_collision_enter(self, contact: sig.Contact) -> None:
+            log.append(f"enter:{id(contact.body_a)}:{id(contact.body_b)}")
+
+        def on_collision_exit(self, a: sig.ObjectSpec, b: sig.ObjectSpec) -> None:
+            log.append(f"exit:{id(a)}:{id(b)}")
+
+    handler = TestHandler()
+    world.add_handler(handler)
+
+    # step until ball hits ground
+    for _ in range(20):
+        world.step(1 / 60)
+
+    assert any(msg.startswith("enter:") for msg in log), log
+
+    # move ball far away so pairs exit
+    ball.x = 1000
+    ball.y = 1000
+    world.step(1 / 60)
+
+    assert any(msg.startswith("exit:") for msg in log), log
+
+
+def test_physics_ray_cast_returns_point_and_distance():
+    ground = sig.ObjectSpec(kind="box_3d", x=0, y=0, size=20, collision_shape=sig.CollisionShape.AABB)
+    world = sig.PhysicsWorld(gravity=(0, 0))
+    world.add_body(ground, sig.RigidBodySpec(is_static=True))
+
+    # ray downward from well above the box AABB (object_aabb treats x,y as
+    # centre, so size=20 gives half_w=half_h=10 → AABB=[-10,10]×[-10,10])
+    hit = world.ray_cast((0, -30), (0, 1), 100)
+    assert hit is not None
+    assert hit.obj is ground
+    assert -10.5 < hit.point[1] < -9.5  # enters near the top edge y≈-10
+    assert 19.0 <= hit.distance <= 21.0
+
+    # ray that avoids everything
+    no_hit = world.ray_cast((100, 100), (0, 1), 50)
+    assert no_hit is None
+
+
+# ---------------------------------------------------------------------------
+# Behavior outcome validation (flee distance, bounce particles emit)
+# ---------------------------------------------------------------------------
+
+
+def test_behavior_flee_increases_distance_from_player():
+    """Attach 'flee' to a physics_sandbox trajectory and verify the
+    fleer ends up further away than it started from the player."""
+    from synthetic_image_generator.behaviors import _attach_flee
+
+    player = sig.ObjectSpec(kind="sphere_3d", name="player", x=20, y=18, radius=2, tags={"player"})
+    fleer = sig.ObjectSpec(kind="sphere_3d", name="fleer", x=30, y=18, radius=2, tags={"enemy"})
+    scene = sig.SceneSpec(objects=[player, fleer])
+    graph = sig.SceneGraph(
+        scene_spec=scene, camera=sig.CameraSpec(viewport_width=64, viewport_height=64), seed=1,
+    )
+
+    _attach_flee(graph, rng=np.random.RandomState(0))
+
+    start_dist = np.hypot(fleer.x - player.x, fleer.y - player.y)
+    for _ in range(30):
+        graph.update(1 / 60, sig.InputState())
+    end_dist = np.hypot(fleer.x - player.x, fleer.y - player.y)
+
+    assert end_dist > start_dist + 0.5, f"flee should increase distance: {start_dist:.1f} -> {end_dist:.1f}"
+
+
+def test_behavior_bounce_particles_emits_particles():
+    """Attach 'bounce_particles' and verify the particle pool has alive
+    particles after a few ticks."""
+    from synthetic_image_generator.behaviors import _attach_bounce_particles
+
+    obj = sig.ObjectSpec(kind="sphere_3d", name="emitter", x=16, y=16, radius=4, tags={"ball"})
+    scene = sig.SceneSpec(objects=[obj])
+    graph = sig.SceneGraph(
+        scene_spec=scene, camera=sig.CameraSpec(viewport_width=32, viewport_height=32), seed=2,
+    )
+
+    _attach_bounce_particles(graph, rng=np.random.RandomState(1))
+
+    assert len(graph.particles) >= 1, "bounce_particles must add at least one pool"
+    for _ in range(20):
+        graph.update(1 / 60, sig.InputState())
+    alive_counts = [pool.alive.sum() for pool in graph.particles]
+    assert sum(alive_counts) > 0, "particles should become alive after auto-emission"
