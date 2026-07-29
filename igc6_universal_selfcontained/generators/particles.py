@@ -37,10 +37,17 @@ def _rgba(c: Color) -> tuple[float, float, float, float]:
 
 
 class ParticlePool:
-    """Fixed-capacity particle buffer for one emitter."""
+    """Fixed-capacity particle buffer for one emitter.
 
-    def __init__(self, emitter: ParticleEmitterSpec):
+    ``origin`` is optional and only consulted by ``SceneGraph.update`` (this
+    module itself never reads it): a fixed ``(x, y)`` world point, or an
+    ``ObjectSpec.name`` string to follow that object's position each frame.
+    Leave it ``None`` to keep driving ``emit``/``emit_continuous`` manually.
+    """
+
+    def __init__(self, emitter: ParticleEmitterSpec, origin: tuple[float, float] | str | None = None):
         self.emitter = emitter
+        self.origin = origin
         n = emitter.max_particles
         self.positions = np.zeros((n, 2), np.float32)
         self.velocities = np.zeros((n, 2), np.float32)

@@ -1113,3 +1113,114 @@ def test_export_html_writes_self_contained_interactive_file(tmp_path):
     content = path.read_text()
     assert "<canvas" in content and "Test Scene" in content
     assert '"player"' in content
+
+
+def test_scene_graph_end_to_end_determinism_and_cx_cy_normalization():
+    def build_graph():
+        ground = sig.ObjectSpec(
+            kind="box_3d", cx=16, cy=4, size=32, collision_shape=sig.CollisionShape.AABB, tags={"ground"}
+        )
+        ball = sig.ObjectSpec(
+            kind="sphere_3d", x=16, y=28, radius=3, collision_shape=sig.CollisionShape.CIRCLE, name="ball"
+        )
+        scene = sig.SceneSpec(objects=[ground, ball])
+        physics = sig.PhysicsWorld(gravity=(0, -50))
+        physics.add_body(ground, sig.RigidBodySpec(is_static=True))
+        physics.add_body(ball, sig.RigidBodySpec(mass=1.0, restitution=0.2))
+        graph = sig.SceneGraph(
+            scene_spec=scene,
+            camera=sig.CameraSpec(viewport_width=32, viewport_height=32),
+            physics=physics,
+            seed=3,
+        )
+        return graph, ground, ball
+
+    graph_a, ground_a, ball_a = build_graph()
+    graph_b, ground_b, ball_b = build_graph()
+
+    # ground was built with cx/cy; add_body must normalize it into x/y or
+    # physics would silently move a field resolved_x/y never reads.
+    assert ground_a.cx is None and ground_a.x == 16.0
+
+    frames_a = [graph_a.tick(1 / 60, sig.InputState()) for _ in range(5)]
+    frames_b = [graph_b.tick(1 / 60, sig.InputState()) for _ in range(5)]
+
+    for fa, fb in zip(frames_a, frames_b):
+        assert np.array_equal(fa, fb)
+    assert ball_a.x == ball_b.x and ball_a.y == ball_b.y
+    assert ball_a.y < 28  # gravity actually moved it
+
+
+def test_scene_graph_composes_tilemap_sprites_and_hud_in_one_frame():
+    tile_img = np.zeros((8, 8, 4), np.uint8)
+    tile_img[:, :] = (255, 0, 0, 255)
+    tile_region = sig.AtlasRegion(name="tile", x=0, y=0, width=8, height=8)
+    tile_atlas = sig.AtlasSpec(image=tile_img, regions=(tile_region,), default_region="tile")
+    tiles = np.ones((4, 4), np.uint16)
+    tilemap = sig.TilemapSpec(width=4, height=4, tile_size=8, tiles=tiles, tileset=tile_atlas)
+
+    sprite_img = np.zeros((8, 8, 4), np.uint8)
+    sprite_img[:, :] = (0, 255, 0, 255)
+    sprite_region = sig.AtlasRegion(name="hero", x=0, y=0, width=8, height=8)
+    sprite_atlas = sig.AtlasSpec(image=sprite_img, regions=(sprite_region,), default_region="hero")
+
+    hero = sig.ObjectSpec(kind="sphere_3d", x=16, y=16, sprite=sprite_region, name="hero")
+    scene = sig.SceneSpec(background=sig.Background(kind="none"), objects=[hero])
+    hud = sig.HUD([sig.WidgetSpec(kind="rect", x=0, y=0, width=6, height=6, color=(1, 1, 1))])
+
+    graph = sig.SceneGraph(
+        scene_spec=scene,
+        camera=sig.CameraSpec(viewport_width=32, viewport_height=32, world_x=16, world_y=16),
+        atlas=sprite_atlas,
+        tilemaps=[tilemap],
+        hud=hud,
+    )
+    frame = graph.tick(1 / 60, sig.InputState())
+
+    assert frame.shape == (32, 32, 4)
+    assert tuple(frame[16, 16][:3]) == (0, 255, 0)  # sprite wins over the tile beneath it
+    assert tuple(frame[28, 28][:3]) == (255, 0, 0)  # tile still shows where nothing sits on top
+    assert tuple(frame[0, 0][:3]) == (255, 255, 255)  # HUD wins over everything
+
+
+def test_scene_graph_update_drives_animations_without_manual_wiring():
+    hero = sig.ObjectSpec(kind="sphere_3d", name="hero", x=0, y=16, radius=4)
+    scene = sig.SceneSpec(objects=[hero])
+    track = sig.AnimationTrack([sig.Tween(target="hero", property="x", from_value=0, to_value=32, duration=1.0)])
+    graph = sig.SceneGraph(
+        scene_spec=scene, camera=sig.CameraSpec(viewport_width=32, viewport_height=32), animations=[track]
+    )
+
+    graph.update(0.5, sig.InputState())
+    assert hero.x == 16.0
+    graph.update(0.5, sig.InputState())
+    assert hero.x == 32.0 and track.finished
+
+
+def test_scene_graph_update_auto_emits_particles_with_origin_deterministically():
+    emitter = sig.ParticleEmitterSpec(rate=100.0, lifetime=(1.0, 1.0), speed=(0, 0), max_particles=8)
+    pool = sig.ParticlePool(emitter, origin=(16.0, 16.0))
+    graph = sig.SceneGraph(scene_spec=sig.SceneSpec(), particles=[pool])
+
+    graph.update(0.5, sig.InputState())
+    assert pool.alive.sum() > 0  # emitted with no manual pool.emit*() call
+
+    pool_a = sig.ParticlePool(sig.ParticleEmitterSpec(rate=50.0, max_particles=16), origin=(0.0, 0.0))
+    pool_b = sig.ParticlePool(sig.ParticleEmitterSpec(rate=50.0, max_particles=16), origin=(0.0, 0.0))
+    graph_a = sig.SceneGraph(scene_spec=sig.SceneSpec(), particles=[pool_a], seed=5)
+    graph_b = sig.SceneGraph(scene_spec=sig.SceneSpec(), particles=[pool_b], seed=5)
+    graph_a.update(0.5, sig.InputState())
+    graph_b.update(0.5, sig.InputState())
+    assert np.array_equal(pool_a.positions, pool_b.positions)  # same seed -> same draws
+
+
+def test_scene_graph_particle_origin_can_follow_a_named_object():
+    hero = sig.ObjectSpec(kind="sphere_3d", name="hero", x=5, y=7, radius=2)
+    emitter = sig.ParticleEmitterSpec(rate=100.0, lifetime=(1.0, 1.0), speed=(0, 0), max_particles=8)
+    pool = sig.ParticlePool(emitter, origin="hero")
+    graph = sig.SceneGraph(scene_spec=sig.SceneSpec(objects=[hero]), particles=[pool])
+
+    graph.update(0.5, sig.InputState())
+    alive = pool.alive
+    assert alive.any()
+    assert np.allclose(pool.positions[alive][0], (5.0, 7.0))

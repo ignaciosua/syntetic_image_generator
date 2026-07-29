@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.24.0
+
+Wires the two remaining standalone systems into `SceneGraph.update()`, so
+tweens and particle emission no longer need manual per-frame driving from
+the caller.
+
+- `SceneGraph` gains `animations: list[AnimationTrack]`; `update()` calls
+  `track.update(dt, scene_spec)` for each, before physics steps (so a
+  Tween-driven kinematic object's new position is what physics sees that
+  frame).
+- `ParticlePool` gains an optional `origin: tuple[float, float] | str |
+  None`. `SceneGraph.update()` auto-calls `emit_continuous` for any pool
+  with an origin set — a fixed world point, or an `ObjectSpec.name` to
+  follow every frame via `SceneQuery`. Emission is deterministic: each pool
+  gets its own `RandomState` seeded from `SceneGraph.seed` plus its index in
+  `particles`, built once and reused every update. Pools without an
+  `origin` are unaffected (still driven manually, as before — fully
+  backward compatible with 0.22.0/0.23.0 usage).
+- Added tests covering both: a Tween moving an object with zero manual
+  wiring, two independently-seeded pools producing identical draws, and a
+  pool following a named object's live position.
+
+## 0.23.0
+
+Closes the gap left by 0.22.0: `SceneGraph.render()` previously only called
+`make_scene` and drew particles, leaving `LayerManager`, `TilemapRenderer`,
+sprite atlases, and `HUD` as disconnected utilities the caller had to
+composite by hand.
+
+- `SceneGraph` gains `atlas`/`tilemaps`/`hud` fields. `render()` now composes
+  bottom to top: tilemaps -> the scene (per-layer composited via
+  `LayerManager` if any layers are registered, else one plain `make_scene`
+  call, unchanged from 0.22.0) -> sprite-tagged objects (`ObjectSpec.sprite`/
+  `flipbook`, stamped via the atlas and excluded from the `make_scene` pass)
+  -> particles -> HUD. Every step is still either the public `make_scene` or
+  a plain numpy alpha-composite; nothing new touches renderer internals.
+  `update()` now also advances `flipbook` playback time and dispatches HUD
+  click events (`SceneGraph.last_hud_events`).
+- Fixed a footgun in `PhysicsWorld.add_body`: bodies built with the `cx`/
+  `cy`/`ground_y` aliases (which `resolved_x`/`resolved_y` prefer over `x`/
+  `y`) were simulated but never visibly moved, because physics only wrote
+  `x`/`y`. `add_body` now normalizes the aliases into `x`/`y` once, up front.
+- Added an end-to-end test: two independently constructed `SceneGraph`s with
+  physics, the same seed, and the same input sequence produce byte-identical
+  frames over 5 ticks, and a second test proves the full tilemap/sprite/HUD
+  compositing order in one frame.
+
 ## 0.22.0
 
 Phases 2-13 of the scene-graph/mini-game-engine roadmap (`SCENE_GRAPH_PLAN.md`),
