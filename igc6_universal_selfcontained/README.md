@@ -273,6 +273,37 @@ Objects are composed from far to near according to `depth`. Child reference
 cycles, invalid seeds, non-finite depths, unsupported objects, and malformed
 scene components are rejected before rendering.
 
+### Procedural materials
+
+Geometric 3D objects can receive deterministic textures without an image
+asset pipeline:
+
+```python
+from synthetic_image_generator import MaterialSpec
+
+table = ObjectSpec(
+    kind="box_3d", x=16, y=20, size=12, color=(0.45, 0.25, 0.1),
+    material=MaterialSpec(name="wood", scale=1.2, rotation=15, seed=3),
+)
+```
+
+Available names are `flat`, `wood`, `brushed_metal`, `marble`, `stone`,
+`concrete`, `fabric`, `water`, and `emissive`. The material field is evaluated
+from NumPy only, so the same scene and seed always produce the same RGB field;
+existing `make_image` output remains unchanged.
+
+For scene composition, `LayoutSpec` and `LayoutRelation` support deterministic
+constraints such as `left_of`, `right_of`, `above`, `below`, `behind`, and
+`in_front_of` between named objects. The resolver copies the scene, so caller
+objects are never mutated.
+
+`scene_to_dict(scene)` and `scene_from_dict(data)` provide a JSON-compatible
+round trip for the complete declarative scene, including nested objects,
+materials, layers and layout. A running `SceneGraph` can additionally produce
+and restore a mutable checkpoint with `graph.snapshot()` and
+`graph.restore_snapshot(...)`, covering object positions, physics velocities,
+tween progress and the fixed-step clock.
+
 ## Scene graph / mini game engine
 
 An additive layer on top of `make_scene` adds camera/viewport transforms,
@@ -339,6 +370,64 @@ indexed contract only.
 
 ## Scene catalog
 
+Para inspeccionar los arquetipos como mini-simulaciones interactivas del
+`SceneGraph`, ejecuta:
+
+```bash
+python scripts/render_scene_archetype_demos.py
+```
+
+Esto genera `media/scene_archetype_demos/index.html`, con una tarjeta por cada
+uno de los 48 arquetipos y sus controles de simulación.
+
+Para inspeccionar los efectos visuales de cámara:
+
+```bash
+python scripts/render_camera_effect_demos.py
+```
+
+Esto genera `media/camera_effect_demos/index.html` con variantes reales de
+viñeta, grayscale, scanlines, flash, motion blur, aberración cromática,
+pixelado y grano de película.
+
+La galería de arquetipos reproduce ahora 12 frames por escena generados por el
+renderer Python real. No usa el canvas proxy JS como vista principal; el proxy
+sólo debe considerarse una herramienta experimental para interacción web.
+
+Para entrenamiento temporal usa el exportador de secuencias largas:
+
+```bash
+python scripts/export_scene_training_dataset.py --quality training
+```
+
+La política usa 1 frame para escenas estáticas, 120 para tweens/caídas, 180
+para partículas, patrol, chase y rebotes, y 240 para física y órbitas. `fast`
+limita las secuencias a 60 frames y `preview` a 12. El manifiesto incluye
+clasificación `static`, `loop` o `evolving`, repeticiones detectadas y
+desplazamiento máximo.
+
+Las escenas también pueden renderizarse con una salida mayor que la imagen
+legacy de 32×32. `SceneGraph` separa el mundo de la cámara y del raster:
+
+```python
+graph.camera.viewport_width = 512
+graph.camera.viewport_height = 512
+graph.camera.world_x = 300
+graph.camera.world_y = 220
+frame = graph.render()  # (512, 512, 4)
+```
+
+Para generar vistas panorámicas reproducibles usa
+`make_scene_camera_trajectory(idx, n_frames=120)`. La cámara se desplaza sin
+mutar la especificación compartida del catálogo.
+
+The scene-level catalog exposes 154 deterministic entries backed by 48 reusable
+archetypes. Use `scene_level_spec(idx)` to inspect the declarative contract,
+`make_scene_level(idx)` for one RGBA frame, and
+`make_scene_trajectory_level(idx)` for a reproducible fixed-step trajectory.
+`scene_level_start(level, cycle=1)` selects the same structural level in a later
+seed cycle without repeating its geometry.
+
 The same `idx -> deterministic sample` schedule `make_image`/`LEVEL_TABLE`
 use for indexed images, applied to whole scenes and their dynamics:
 
@@ -373,7 +462,24 @@ batch of samples to disk.
 
 ## Raster output
 
-`RasterSpec.width` is the X resolution and `height` is the Y resolution.
+Indexed images and structured scenes render natively at the requested
+resolution; dimensions are no longer produced by enlarging a 32×32 render.
+For float32 RGB output, pass `width` and `height` directly:
+
+```python
+native = make_image(42, width=192, height=108)
+assert native.shape == (108, 192, 3)
+assert native.dtype.name == "float32"
+```
+
+Both dimensions must be supplied together. Native canvases support
+32–4096 pixels per axis and at most 8,388,608 total pixels. The default
+remains byte-exact 32×32 output. Coordinates in `SceneSpec` remain canonical
+32×32 coordinates and are scaled non-destructively to the native canvas.
+
+`RasterSpec.width` is the X resolution and `height` is the Y resolution. A
+RasterSpec whose axes are at least 32 pixels drives the native render canvas
+before color conversion and quantization:
 
 ```python
 from synthetic_image_generator import RasterSpec, make_image
@@ -401,6 +507,11 @@ Supported modes:
 Resize methods are `nearest`, `bilinear`, and `bicubic`. Dithering methods are
 `none`, `ordered`, and `floyd_steinberg`. RGB/RGBA channel tuples can be packed,
 for example `(5, 6, 5)` for RGB565.
+
+For compatibility, raster outputs smaller than 32 pixels on either axis are
+generated by reducing the safe 32×32 native canvas. This is the only indexed
+generation path that spatially resizes; `convert_raster()` can also be used
+directly when explicit conversion of an existing image is desired.
 
 ```python
 rgb565 = make_image(

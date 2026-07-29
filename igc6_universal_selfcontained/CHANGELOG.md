@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.26.0
+
+**Native-resolution rendering, procedural materials, semantic layout, and
+scene-level catalog.**
+
+- `make_image(idx, width=W, height=H)` renders natively at arbitrary
+  resolution (32–4096 px/axis, ≤8.3M px total). All indexed geometry
+  primitives scale proportionally. The default 32×32 contract is unchanged.
+- `RasterSpec` dimensions ≥32 px now drive the native canvas before
+  format conversion. Tiny legacy rasters are safely reduced from 32×32.
+- `materials.py`: nine procedural materials (`wood`, `brushed_metal`,
+  `marble`, `stone`, `concrete`, `fabric`, `water`, `emissive`, `glass`)
+  evaluated from NumPy. `MaterialSpec` on `ObjectSpec` replaces the uniform
+  albedo with a deterministic texture field.
+- `layout.py`: `LayoutSpec` + `LayoutRelation` apply semantic constraints
+  (`left_of`, `right_of`, `above`, `below`, `behind`, `in_front_of`)
+  without mutating the caller's spec.
+- `camera.py`: camera tracking, dead zones, look-ahead, smoothing, shake,
+  cinematic transitions, and 16 post-effects (vignette, grayscale, scanlines,
+  flash, motion blur, chromatic aberration, pixelate, film grain, fog,
+  depth of field, underwater, night vision, thermal, damage, rain, dust).
+- `SceneGraph`: camera projection for arbitrary viewports, `snapshot()` /
+  `restore_snapshot()`, impact shake, and camera transition scheduling.
+- `scene_level_catalog.py`: 154 deterministic scene levels across 48
+  archetypes × 7 variants × 7 styles × 9 simulation modes. Includes training
+  trajectory export, camera trajectories (14 modes), and quality/diversity
+  validation.
+- `scene_serialization.py`: `scene_to_dict()` / `scene_from_dict()` for
+  JSON round-trips of complete declarative scenes.
+- New scripts: `render_scene_archetype_demos.py`,
+  `render_camera_effect_demos.py`, `export_scene_training_dataset.py`,
+  `render_scene_level_gallery.py`.
+- 13 new test modules covering native resolution, materials, layout, scene
+  catalog, camera, serialization, snapshots, quality, diversity, dynamics,
+  temporal policy, trajectories, and compatibility.
+- `render_generator_atlas.py` supports `--resolution` for native tile size.
+
 ## 0.25.4
 
 **Wall/platform collision for chase & flee (`platformer`/`top_down_arena`/

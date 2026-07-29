@@ -1,4 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
+import re
 
 import numpy as np
 import pytest
@@ -44,6 +46,38 @@ def test_public_scene_rgba_has_real_transparency_and_xy_resolution():
     assert rgba[..., 3].min() == 0
     assert rgba[..., 3].max() > 0
     assert np.any((rgba[..., 3] > 0) & (rgba[..., 3] < 255))
+
+
+def test_scene_materials_are_deterministic_and_change_albedo():
+    base = (0.45, 0.30, 0.18)
+    flat = sig.SceneSpec(objects=[sig.ObjectSpec(kind="sphere_3d", x=16, y=16, radius=8, color=base)])
+    wood = sig.SceneSpec(objects=[sig.ObjectSpec(kind="sphere_3d", x=16, y=16, radius=8, color=base,
+                                                   material=sig.MaterialSpec(name="wood", seed=7))])
+    a = sig.make_scene(wood)
+    b = sig.make_scene(wood)
+    c = sig.make_scene(flat)
+    assert np.array_equal(a, b)
+    assert np.isfinite(a).all()
+    assert not np.array_equal(a, c)
+
+
+def test_material_parameters_are_validated():
+    scene = sig.SceneSpec(objects=[sig.ObjectSpec(kind="sphere_3d", material=sig.MaterialSpec(name="unknown"))])
+    with pytest.raises(ValueError, match="unknown material"):
+        sig.make_scene(scene)
+
+
+def test_semantic_layout_resolves_named_relations_deterministically():
+    left = sig.ObjectSpec(kind="box_3d", name="left", x=4, y=10, size=4)
+    right = sig.ObjectSpec(kind="box_3d", name="right", x=20, y=10, size=4)
+    scene = sig.SceneSpec(objects=[left, right], layout=sig.LayoutSpec(
+        relations=(sig.LayoutRelation("left_of", "left", "right", gap=2),),
+    ))
+    image = sig.make_scene(scene)
+    assert image.shape == (32, 32, 3)
+    assert scene.objects[0].x == 4  # resolver does not mutate caller-owned specs
+    resolved = sig.make_scene(scene)
+    assert np.array_equal(image, resolved)
 
 
 def test_public_raster_modes_and_bit_depths():
@@ -1132,6 +1166,53 @@ def test_export_html_writes_self_contained_interactive_file(tmp_path):
     content = path.read_text()
     assert "<canvas" in content and "Test Scene" in content
     assert '"player"' in content
+
+
+def test_scene_graph_flattens_nested_descendants_consistently():
+    grandchild = sig.ObjectSpec(kind="disc", name="grandchild", x=3, y=4)
+    child = sig.ObjectSpec(kind="disc", name="child", x=2, y=3, children=[grandchild])
+    root = sig.ObjectSpec(kind="disc", name="root", x=1, y=2, children=[child])
+    graph = sig.SceneGraph(scene_spec=sig.SceneSpec(objects=[root]))
+
+    assert [obj.name for obj in graph.objects] == ["root", "child", "grandchild"]
+    assert [obj.name for obj in sig.SceneQuery(graph.scene_spec)._objects] == [
+        "root", "child", "grandchild"
+    ]
+
+
+def test_live_export_serializes_runtime_physics_and_tween_state(tmp_path):
+    body_obj = sig.ObjectSpec(
+        kind="sphere_3d", name="ball", x=0, y=0, radius=1,
+        collision_shape=sig.CollisionShape.CIRCLE,
+    )
+    mover = sig.ObjectSpec(kind="box_3d", name="mover", x=0, y=0, size=2)
+    physics = sig.PhysicsWorld(gravity=(0, 0))
+    physics.add_body(body_obj, sig.RigidBodySpec(velocity=(10, 0), linear_damping=0.0))
+    tween = sig.Tween(target="mover", property="x", from_value=0, to_value=10,
+                      duration=1.0, loop=True, ping_pong=True)
+    graph = sig.SceneGraph(
+        scene_spec=sig.SceneSpec(objects=[body_obj, mover]),
+        physics=physics,
+        animations=[sig.AnimationTrack([tween])],
+    )
+    graph.update(0.75, sig.InputState())
+
+    path = tmp_path / "live.html"
+    sig.export_live_html(graph, str(path))
+    content = path.read_text()
+    physics_json = json.loads(re.search(r"const PHYSICS = (.*?);\n", content).group(1))
+    animations_json = json.loads(re.search(r"const ANIMATIONS = (.*?);\n", content).group(1))
+
+    assert physics_json["bodies"][0]["vx"] == pytest.approx(10.0)
+    assert physics_json["bodies"][0]["vy"] == pytest.approx(0.0)
+    assert animations_json[0]["elapsed"] == pytest.approx(0.75)
+    assert animations_json[0]["reversed"] is False
+
+    graph.update(0.5, sig.InputState())
+    sig.export_live_html(graph, str(path))
+    content = path.read_text()
+    animations_json = json.loads(re.search(r"const ANIMATIONS = (.*?);\n", content).group(1))
+    assert animations_json[0]["reversed"] is True
 
 
 def test_scene_graph_end_to_end_determinism_and_cx_cy_normalization():

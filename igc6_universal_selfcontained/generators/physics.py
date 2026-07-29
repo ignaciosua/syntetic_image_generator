@@ -118,6 +118,14 @@ class PhysicsWorld:
     def entries(self) -> list[tuple[ObjectSpec, RigidBodySpec]]:
         return list(self._entries)
 
+    def velocity(self, obj: ObjectSpec) -> tuple[float, float]:
+        """Return the current runtime velocity for a registered body."""
+
+        if not self.has_body(obj):
+            raise KeyError("object is not registered in this physics world")
+        vx, vy = self._velocities.get(id(obj), (0.0, 0.0))
+        return float(vx), float(vy)
+
     def add_body(self, obj: ObjectSpec, body: RigidBodySpec) -> None:
         obj.x, obj.y = obj.resolved_x, obj.resolved_y
         obj.cx = obj.cy = obj.ground_y = None
