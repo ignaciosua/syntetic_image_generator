@@ -37,7 +37,7 @@ _MAX_BEHAVIORS = 3
 # any change touching archetype/behavior geometry or RNG draw order must
 # update this alongside a version bump — same rule LEGACY_LEVEL_SAMPLE_SHA256
 # already follows for the indexed image contract.
-SCENE_TRAJECTORY_SAMPLE_SHA256 = "e4cce49630784b0c871454e056b8867f9e611efbe7b7e54320b27cb3b97300f1"
+SCENE_TRAJECTORY_SAMPLE_SHA256 = "c368086ad6da66b5e134e2a7074343ff7345ef293c08effb48efa3939a0914a6"
 
 
 @dataclass

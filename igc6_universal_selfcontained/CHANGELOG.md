@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.25.4
+
+**Wall/platform collision for chase & flee (`platformer`/`top_down_arena`/
+`crowd`):** these archetypes tag their walls/ground/platforms
+`collision_shape=AABB`, but nothing ever attached a `PhysicsWorld` for
+them — only `gravity_drop` did, and it's only compatible with
+`physics_playground`/`stacked_boxes`. So `chase`/`flee` steered straight
+through walls with zero regard for them (confirmed in the real engine, not
+just the HTML export). Fixed:
+- `PhysicsWorld.set_velocity()` (new): drive a body by intent (a desired
+  velocity) instead of writing its position directly, so `step()`'s
+  collision resolution still gets the final say.
+- `generators/behaviors.py`: new `_attach_solid_walls()` gives
+  `wall`/`ground`/`platform`-tagged objects a static body (creating a
+  zero-gravity `PhysicsWorld` if needed; a no-op for archetypes with none,
+  e.g. `crowd`). `_ChaseController` now sets velocity via physics when the
+  chaser has a body — walls actually block the chase/flee instead of being
+  walked through. Falls back to the old direct-position path otherwise
+  (unchanged behavior for `crowd`, which has no walls).
+- `export_live_html`: the keyboard-driven player (client-side only —
+  Python has no input system driving it) gets a synthetic kinematic body
+  when the archetype has walls, purely for the export, so it collides with
+  them too instead of walking straight through.
+- JS engine synced to match (`contactNormalAndPenetration`/
+  `exactHalfExtents` mirror `physics.py`'s `_contact_normal_and_penetration`/
+  `_exact_half_extents`; chase sets a physics body's velocity when one
+  exists). Verified against Python frame-by-frame via the Node harness.
+- `SCENE_TRAJECTORY_SAMPLE_SHA256` updated (chase geometry changed for any
+  sample that draws `chase`/`flee`); `SCENE_CATALOG_SAMPLE_SHA256`
+  unchanged (`make_scene_catalog` never attaches behaviors).
+
+## 0.25.3
+
+**Collision penetration/normal fix (affects v0.10–v0.25.2 `PhysicsWorld`):**
+`_resolve_collisions` computed penetration depth via the generic,
+deliberately-padded `object_aabb()` (floors half-extent at `ObjectSpec`'s
+`radius=5.0`/`size=8.0` defaults even for shapes that never set them),
+and always took the contact normal as the center-to-center direction —
+only valid for circle-circle pairs. Together these made any physics body
+without an explicit `width`/`height` matching its true size (e.g. a ball
+with only `radius` set) get resolved against a phantom, oversized box, and
+any AABB-involving contact (ground, walls, stacked boxes) could get a
+diagonal normal instead of axis-aligned — compounding into runaway
+velocity within a few dozen frames (`gravity_drop`-driven scenes exploding
+out of world bounds instead of settling). Fixed by computing penetration
+and normal from each object's own exact geometry (radius for circles,
+width/height for boxes) via the new `_exact_half_extents`/
+`_contact_normal_and_penetration` helpers, with box-involving pairs using
+the axis of minimum penetration (standard SAT-style separation) for the
+normal instead of center-to-center. `stacked_boxes`/`physics_playground`
+now settle into resting stacks/bounces instead of diverging.
+`SCENE_TRAJECTORY_SAMPLE_SHA256` updated (`make_scene_trajectory` output
+changes for any sample that ends up running `gravity_drop`);
+`SCENE_CATALOG_SAMPLE_SHA256` is unchanged (`make_scene_catalog` never
+attaches behaviors, so no physics ever ran there).
+
+**Live HTML export (`export_live_html`, `generators/web_export.py`):**
+new exporter alongside `export_html` — ports `PhysicsWorld` and the
+`generators.behaviors` controllers (patrol/chase/flee/orbit) to a JS
+engine driven by the exact deterministic parameters the Python side
+computed (positions, tween endpoints, chase speeds, gravity, restitution,
+...), so the exported page runs a real simulation instead of a static
+snapshot. No client-side RNG, no need to port numpy's RNG to match a
+Python `idx` bit-for-bit. Verified against the Python engine by running
+the emitted `<script>` under Node with DOM calls stubbed (gravity,
+collision, chase, and tween all reproduce the same outcome as the
+Python side). `bounce_particles` isn't ported (no particle rendering
+client-side yet — physics/collisions still run correctly).
+`scripts/render_scene_graph_demos.py` now builds all 8 scene-catalog
+archetypes through `export_live_html` (previously used hand-written
+pixel-space demos disconnected from the real archetype/behavior registry,
+and before that, a broken variant that plugged 32-unit world coordinates
+directly into a much larger canvas with no scaling).
+
 ## 0.25.0
 
 Implements `SCENE_CATALOG_PLAN.md` in full: an indexed, deterministic

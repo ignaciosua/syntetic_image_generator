@@ -64,12 +64,20 @@ def _attach_patrol(graph: SceneGraph, rng: np.random.RandomState) -> None:
 class _ChaseController:
     """Duck-typed like ``AnimationTrack`` (``.update(dt, scene)``) but steers
     a named object toward (or away from) another every frame — a
-    fixed-endpoint ``Tween`` can't do this since the target keeps moving."""
+    fixed-endpoint ``Tween`` can't do this since the target keeps moving.
+
+    When ``physics`` is set (the archetype has walls to collide with), the
+    chase is expressed as a desired velocity handed to the physics body
+    instead of a direct position write — ``PhysicsWorld.step()`` (called
+    right after animations, same frame) then gets the final say, so a wall
+    actually blocks the chase instead of the chaser walking through it.
+    """
 
     chaser_name: str
     target_name: str
     speed: float
     flee: bool = False
+    physics: PhysicsWorld | None = None
 
     def update(self, dt: float, scene: SceneSpec) -> None:
         query = SceneQuery(scene)
@@ -80,9 +88,30 @@ class _ChaseController:
         dy = target.resolved_y - chaser.resolved_y
         dist = math.hypot(dx, dy) or 1e-6
         sign = -1.0 if self.flee else 1.0
-        chaser.x = chaser.resolved_x + sign * (dx / dist) * self.speed * dt
-        chaser.y = chaser.resolved_y + sign * (dy / dist) * self.speed * dt
+        vx, vy = sign * (dx / dist) * self.speed, sign * (dy / dist) * self.speed
+        if self.physics is not None and self.physics.has_body(chaser):
+            self.physics.set_velocity(chaser, vx, vy)
+            return
+        chaser.x = chaser.resolved_x + vx * dt
+        chaser.y = chaser.resolved_y + vy * dt
         chaser.cx = chaser.cy = chaser.ground_y = None
+
+
+def _attach_solid_walls(graph: SceneGraph) -> None:
+    """Give ``wall``/``ground``/``platform``-tagged objects a static physics
+    body so movement behaviors that go through ``PhysicsWorld`` (currently
+    just chase/flee) actually collide with them. A no-op if the archetype
+    has none (e.g. ``crowd``, which has no walls at all)."""
+
+    query = SceneQuery(graph.scene_spec)
+    walls = query.tagged("wall") + query.tagged("ground") + query.tagged("platform")
+    if not walls:
+        return
+    if graph.physics is None:
+        graph.physics = PhysicsWorld(gravity=(0.0, 0.0))
+    for wall in walls:
+        if not graph.physics.has_body(wall):
+            graph.physics.add_body(wall, RigidBodySpec(is_static=True))
 
 
 def _attach_chase_or_flee(graph: SceneGraph, rng: np.random.RandomState, flee: bool) -> None:
@@ -90,8 +119,13 @@ def _attach_chase_or_flee(graph: SceneGraph, rng: np.random.RandomState, flee: b
     chaser = _pick_tagged(graph.scene_spec, "enemy", rng) or _pick_tagged(graph.scene_spec, "movable", rng)
     if player is None or chaser is None or chaser is player:
         return
+    _attach_solid_walls(graph)
+    if graph.physics is not None and not graph.physics.has_body(chaser):
+        graph.physics.add_body(chaser, RigidBodySpec(gravity_scale=0.0, restitution=0.0, linear_damping=0.0))
     speed = float(rng.uniform(4.0, 12.0))
-    graph.animations.append(_ChaseController(_ensure_name(chaser), _ensure_name(player), speed, flee=flee))
+    graph.animations.append(
+        _ChaseController(_ensure_name(chaser), _ensure_name(player), speed, flee=flee, physics=graph.physics)
+    )
 
 
 def _attach_chase(graph: SceneGraph, rng: np.random.RandomState) -> None:
