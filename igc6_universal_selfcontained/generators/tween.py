@@ -14,9 +14,18 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from .scene_graph import SceneQuery
 from .scene_spec import ObjectSpec, SceneSpec
+
+
+class Updatable(Protocol):
+    """Anything ``SceneGraph.animations`` can drive: ``AnimationTrack`` is
+    one implementation; ``generators.behaviors`` adds others (chase/orbit)
+    that don't fit the fixed from/to shape of a ``Tween``."""
+
+    def update(self, dt: float, scene: SceneSpec) -> None: ...
 
 
 def _ease(kind: str, t: float) -> float:

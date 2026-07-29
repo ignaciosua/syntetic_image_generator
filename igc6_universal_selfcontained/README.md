@@ -287,10 +287,10 @@ from synthetic_image_generator import (
     RigidBodySpec, SceneGraph, SceneSpec,
 )
 
-ground = ObjectSpec(kind="box_3d", x=16, y=4, size=32, collision_shape=CollisionShape.AABB)
-ball = ObjectSpec(kind="sphere_3d", x=16, y=28, radius=3, collision_shape=CollisionShape.CIRCLE, name="ball")
+ground = ObjectSpec(kind="box_3d", x=16, y=28, size=32, collision_shape=CollisionShape.AABB)
+ball = ObjectSpec(kind="sphere_3d", x=16, y=4, radius=3, collision_shape=CollisionShape.CIRCLE, name="ball")
 
-physics = PhysicsWorld(gravity=(0, -50))
+physics = PhysicsWorld(gravity=(0, 50))  # positive y falls down the image
 physics.add_body(ground, RigidBodySpec(is_static=True))
 physics.add_body(ball, RigidBodySpec(mass=1.0, restitution=0.4))
 
@@ -321,6 +321,40 @@ rationale and [`CHANGELOG.md`](CHANGELOG.md) (0.10.0 onward) for what each
 phase added. It sits outside the byte-exact policy in
 [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md), which covers `make_image`'s
 indexed contract only.
+
+## Scene catalog
+
+The same `idx -> deterministic sample` schedule `make_image`/`LEVEL_TABLE`
+use for indexed images, applied to whole scenes and their dynamics:
+
+```python
+from synthetic_image_generator import make_scene_catalog, make_scene_trajectory
+
+sample = make_scene_catalog(42)  # one composed scene, like make_image(idx)
+assert sample.frames[0].shape == (32, 32, 4)
+assert sample.archetype and sample.seed == 42
+
+trajectory = make_scene_trajectory(42, n_frames=60)  # 60 deterministic frames
+assert len(trajectory.frames) == 60
+assert trajectory.behaviors  # e.g. ["patrol", "gravity_drop"]
+```
+
+`make_scene_catalog(idx)` resolves to one of `SCENE_ARCHETYPES` (composition
+only: object kinds/positions/tags, no physics/behaviors attached) and
+renders one settled frame. `make_scene_trajectory(idx, n_frames=...)` also
+attaches 1-3 behaviors from `BEHAVIORS` compatible with that archetype
+(`patrol`, `chase`, `flee`, `orbit`, `gravity_drop`, `bounce_particles`) and
+ticks the scene forward, recording every frame plus per-object labels
+(`SceneSample.objects_state`, tags + bounding box) and events
+(`SceneSample.events`, physics contacts + HUD clicks) — the same
+`SceneSample` shape works as a detection-label source, an RL trajectory, or
+a world-model replay target, so no consumer has to be picked in advance.
+Both functions are regression-gated (`SCENE_CATALOG_SAMPLE_SHA256`/
+`SCENE_TRAJECTORY_SAMPLE_SHA256`) the same way the indexed image catalog is,
+under an independent contract (`SCENE_CATALOG_CONTRACT_VERSION`) that never
+touches `make_image`'s. See [`SCENE_CATALOG_PLAN.md`](SCENE_CATALOG_PLAN.md)
+for the full design and `scripts/export_scene_dataset.py` for writing a
+batch of samples to disk.
 
 ## Raster output
 

@@ -144,6 +144,25 @@ def test_public_exports_are_declared():
         "SessionPlayer",
         "serialize_objects",
         "export_html",
+        # scene catalog (idx -> SceneSample) and behavior registry
+        "SceneArchetype",
+        "SCENE_ARCHETYPES",
+        "SCENE_CATALOG_CONTRACT_VERSION",
+        "SCENE_CATALOG_CYCLE_SIZE",
+        "SCENE_CATALOG_SAMPLE_SHA256",
+        "SCENE_TRAJECTORY_SAMPLE_SHA256",
+        "N_ARCHETYPES",
+        "SAMPLES_PER_ARCHETYPE",
+        "scene_archetype_of",
+        "scene_seed_of",
+        "SceneSample",
+        "make_scene_catalog",
+        "make_scene_trajectory",
+        "make_scene_catalog_batch",
+        "make_scene_trajectory_batch",
+        "Behavior",
+        "BEHAVIORS",
+        "compatible_behaviors",
     }
 
     assert expected <= set(sig.__all__)
@@ -1000,10 +1019,10 @@ def test_physics_world_gravity_collision_and_raycast():
     assert len(contacts) == 1
 
     falling = sig.ObjectSpec(kind="sphere_3d", x=0, y=100)
-    freefall = sig.PhysicsWorld(gravity=(0, -100))
+    freefall = sig.PhysicsWorld(gravity=(0, 100))  # positive y falls down the image
     freefall.add_body(falling, sig.RigidBodySpec(mass=1.0))
     freefall.step(1.0)
-    assert falling.y < 100
+    assert falling.y > 100
 
 
 def test_input_providers_replay_and_web():
@@ -1118,13 +1137,13 @@ def test_export_html_writes_self_contained_interactive_file(tmp_path):
 def test_scene_graph_end_to_end_determinism_and_cx_cy_normalization():
     def build_graph():
         ground = sig.ObjectSpec(
-            kind="box_3d", cx=16, cy=4, size=32, collision_shape=sig.CollisionShape.AABB, tags={"ground"}
+            kind="box_3d", cx=16, cy=28, size=32, collision_shape=sig.CollisionShape.AABB, tags={"ground"}
         )
         ball = sig.ObjectSpec(
-            kind="sphere_3d", x=16, y=28, radius=3, collision_shape=sig.CollisionShape.CIRCLE, name="ball"
+            kind="sphere_3d", x=16, y=4, radius=3, collision_shape=sig.CollisionShape.CIRCLE, name="ball"
         )
         scene = sig.SceneSpec(objects=[ground, ball])
-        physics = sig.PhysicsWorld(gravity=(0, -50))
+        physics = sig.PhysicsWorld(gravity=(0, 50))  # positive y falls down the image
         physics.add_body(ground, sig.RigidBodySpec(is_static=True))
         physics.add_body(ball, sig.RigidBodySpec(mass=1.0, restitution=0.2))
         graph = sig.SceneGraph(
@@ -1148,7 +1167,7 @@ def test_scene_graph_end_to_end_determinism_and_cx_cy_normalization():
     for fa, fb in zip(frames_a, frames_b):
         assert np.array_equal(fa, fb)
     assert ball_a.x == ball_b.x and ball_a.y == ball_b.y
-    assert ball_a.y < 28  # gravity actually moved it
+    assert ball_a.y > 4  # gravity actually moved it down the image
 
 
 def test_scene_graph_composes_tilemap_sprites_and_hud_in_one_frame():
@@ -1224,3 +1243,62 @@ def test_scene_graph_particle_origin_can_follow_a_named_object():
     alive = pool.alive
     assert alive.any()
     assert np.allclose(pool.positions[alive][0], (5.0, 7.0))
+
+
+def test_scene_archetype_of_and_seed_schedule():
+    with pytest.raises(TypeError):
+        sig.scene_archetype_of(1.5)
+    with pytest.raises(ValueError):
+        sig.scene_archetype_of(-1)
+
+    first = sig.scene_archetype_of(0)
+    assert first is sig.SCENE_ARCHETYPES[0]
+    second = sig.scene_archetype_of(sig.SAMPLES_PER_ARCHETYPE)
+    assert second is sig.SCENE_ARCHETYPES[1]
+    wrapped = sig.scene_archetype_of(sig.SCENE_CATALOG_CYCLE_SIZE)
+    assert wrapped is first  # wraps after one full cycle
+
+    assert sig.scene_seed_of(42) == 42
+
+
+def test_make_scene_catalog_is_deterministic_with_labels():
+    sample1 = sig.make_scene_catalog(0)
+    sample2 = sig.make_scene_catalog(0)
+
+    assert np.array_equal(sample1.frames[0], sample2.frames[0])
+    assert sample1.archetype == sig.SCENE_ARCHETYPES[0].name
+    assert sample1.behaviors == []
+    assert sample1.seed == 0
+
+    player_state = sample1.objects_state[0]["player"]
+    assert set(player_state) == {"x", "y", "tags", "bbox"}
+    assert "player" in player_state["tags"]
+    assert len(player_state["bbox"]) == 4
+
+
+def test_make_scene_trajectory_attaches_compatible_behaviors_deterministically():
+    physics_playground_idx = sig.SAMPLES_PER_ARCHETYPE * 2  # 3rd archetype in the registry
+
+    traj1 = sig.make_scene_trajectory(physics_playground_idx, n_frames=8)
+    traj2 = sig.make_scene_trajectory(physics_playground_idx, n_frames=8)
+
+    assert len(traj1.frames) == 8
+    for f1, f2 in zip(traj1.frames, traj2.frames):
+        assert np.array_equal(f1, f2)
+    assert traj1.behaviors == traj2.behaviors
+    assert traj1.behaviors  # something compatible got attached
+    assert set(traj1.behaviors) <= {b.name for b in sig.compatible_behaviors(traj1.archetype)}
+
+
+def test_compatible_behaviors_matches_registry():
+    assert {b.name for b in sig.compatible_behaviors("orbiting_bodies")} == {"patrol", "orbit"}
+    assert {b.name for b in sig.compatible_behaviors("tilemap_maze")} == {"patrol"}
+
+
+def test_scene_catalog_and_trajectory_batches_are_ordered():
+    catalog_batch = sig.make_scene_catalog_batch([0, 1, 2])
+    assert [s.idx for s in catalog_batch] == [0, 1, 2]
+
+    traj_batch = sig.make_scene_trajectory_batch([0, 1], n_frames=3)
+    assert [s.idx for s in traj_batch] == [0, 1]
+    assert all(len(s.frames) == 3 for s in traj_batch)

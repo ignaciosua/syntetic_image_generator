@@ -28,7 +28,7 @@ class ParticleEmitterSpec:
     end_color: Color = (1.0, 1.0, 1.0, 0.0)
     start_size: float = 4.0
     end_size: float = 0.0
-    gravity: tuple[float, float] = (0.0, -98.0)
+    gravity: tuple[float, float] = (0.0, 98.0)  # positive y falls down the image (see physics.py)
     max_particles: int = 500
 
 
