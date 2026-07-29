@@ -39,7 +39,7 @@ from .scene_graph import SceneQuery
 from .scene_spec import ObjectSpec, RasterSpec, SceneSpec
 from .synthetic_image_generator import make_scene
 from .tilemap import TilemapRenderer, TilemapSpec
-from .tween import AnimationTrack
+from .tween import AnimationTrack, Updatable
 from .ui import HUD
 
 
@@ -97,10 +97,11 @@ class SceneGraph:
     tilemaps: list[TilemapSpec] = field(default_factory=list)
     atlas: AtlasSpec | None = None
     hud: HUD | None = None
-    animations: list[AnimationTrack] = field(default_factory=list)
+    animations: list[Updatable] = field(default_factory=list)
     clock: GameClock = field(default_factory=GameClock)
     seed: int = 0
     last_hud_events: list[str] = field(default_factory=list, init=False, repr=False)
+    last_contacts: list = field(default_factory=list, init=False, repr=False)
     _particle_rngs: dict = field(default_factory=dict, init=False, repr=False)
 
     @property
@@ -119,8 +120,7 @@ class SceneGraph:
         for track in self.animations:
             track.update(dt, self.scene_spec)
 
-        if self.physics is not None:
-            self.physics.step(dt)
+        self.last_contacts = self.physics.step(dt) if self.physics is not None else []
 
         for obj in self.objects:
             if obj.flipbook is not None:

@@ -14,6 +14,7 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 
 from .input_system import InputState
+from .scene_graph import object_aabb
 from .scene_spec import ObjectSpec
 
 
@@ -26,12 +27,21 @@ class FrameRecord:
 
 
 def serialize_objects(objects: list[ObjectSpec]) -> dict:
-    """A lightweight per-frame snapshot (position only) for replay verification."""
+    """A per-frame snapshot for replay verification and scene-catalog labels:
+    position, tags, and an approximate bounding box (``object_aabb``) per
+    object — enough to double as detection-style labels without a second
+    pass over the scene."""
 
-    return {
-        (obj.name or f"#{i}"): {"x": obj.resolved_x, "y": obj.resolved_y}
-        for i, obj in enumerate(objects)
-    }
+    result = {}
+    for i, obj in enumerate(objects):
+        box = object_aabb(obj)
+        result[obj.name or f"#{i}"] = {
+            "x": obj.resolved_x,
+            "y": obj.resolved_y,
+            "tags": sorted(obj.tags),
+            "bbox": [box.x0, box.y0, box.x1, box.y1],
+        }
+    return result
 
 
 def _input_to_dict(state: InputState) -> dict:
@@ -113,9 +123,11 @@ class SessionPlayer:
 if __name__ == "__main__":
     import tempfile
 
-    obj = ObjectSpec(kind="sphere_3d", x=1.0, y=2.0, name="hero")
+    obj = ObjectSpec(kind="sphere_3d", x=1.0, y=2.0, name="hero", tags={"player"})
     snap = serialize_objects([obj])
-    assert snap == {"hero": {"x": 1.0, "y": 2.0}}
+    assert snap["hero"]["x"] == 1.0 and snap["hero"]["y"] == 2.0
+    assert snap["hero"]["tags"] == ["player"]
+    assert len(snap["hero"]["bbox"]) == 4
 
     recorder = SessionRecorder()
     recorder.record(FrameRecord(frame=0, time=0.0, input=InputState(keys_down={"left"}), objects_state=snap))

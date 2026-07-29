@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.25.0
+
+Implements `SCENE_CATALOG_PLAN.md` in full: an indexed, deterministic
+`idx -> SceneSample` catalog on top of the v0.10–v0.24 engine — the scene
+equivalent of `LEVEL_TABLE`/`make_image(idx)` — plus a correctness fix to
+gravity direction that predates this release.
+
+**Gravity sign fix (affects v0.15–v0.24 physics/particle gravity):**
+`_render_object`'s `box_3d` handling (`top = bottom - height`) confirms the
+renderer's `y` grows downward, but `PhysicsWorld`'s and
+`ParticleEmitterSpec`'s default `gravity` was `(0, -98)` — pulling bodies
+*up* the image, not down. Defaults are now `(0, 98)`; every constructed
+example (this file's own text doesn't encode direction, but `README.md`,
+`SCENE_GRAPH_PLAN.md`, and the test suite did and are corrected). Any code
+that explicitly passed a negative `gravity[1]` expecting "down" needs its
+sign flipped.
+
+**Scene catalog (Phase A — composition):**
+- `generators/scene_levels.py`: `SceneArchetype`, an 8-archetype registry
+  (`platformer`, `top_down_arena`, `physics_playground`, `tilemap_maze`,
+  `particle_burst`, `crowd`, `orbiting_bodies`, `stacked_boxes`) — each a
+  `RandomState -> SceneGraph` builder with zero physics/particles-as-dynamics
+  attached (composition only). `scene_archetype_of`/`scene_seed_of` mirror
+  `level_of`/`level_start`'s indexed schedule (`SAMPLES_PER_ARCHETYPE=325`,
+  contract `sgc-8-cycle-v1`), independent of the image catalog's index space.
+- `make_scene_catalog(idx)`: builds the archetype, steps physics a fixed 30
+  settle steps, renders once. Regression-gated by
+  `SCENE_CATALOG_SAMPLE_SHA256` (one sample per archetype), same pattern as
+  `LEGACY_LEVEL_SAMPLE_SHA256`.
+
+**Scene catalog (Phase B — behavior/dynamics):**
+- `generators/behaviors.py`: a 6-behavior registry (`patrol`, `chase`,
+  `flee`, `orbit`, `gravity_drop`, `bounce_particles`), each an
+  `attach(SceneGraph, RandomState)` composing existing `Tween`/
+  `PhysicsWorld`/`ParticlePool` primitives onto an already-built archetype.
+  `chase`/`flee`/`orbit` needed a duck-typed `Updatable` (added to
+  `tween.py`) since a fixed-endpoint `Tween` can't steer toward a moving
+  target — `SceneGraph.animations` now accepts either.
+- `make_scene_trajectory(idx, n_frames=60)`: draws 1-3 compatible behaviors
+  deterministically from the same seed, ticks forward, records every frame
+  plus `objects_state` (now includes `tags`/`bbox`, extended in
+  `replay.serialize_objects`) and `events` (physics contacts + HUD clicks,
+  exposed via new `SceneGraph.last_contacts`). Regression-gated by
+  `SCENE_TRAJECTORY_SAMPLE_SHA256`.
+- `SceneSample` is the shared, consumer-agnostic result type for both
+  functions: frames + labels (vision), + events/`input_log` slot (RL), +
+  `seed` (world-model replay) in one structure.
+
+**Scene catalog (Phase C — batch/export):**
+- `make_scene_catalog_batch`/`make_scene_trajectory_batch`: ordered,
+  sequential batch helpers (no process-pool autotuning like `make_images()`
+  — deferred until a real export is measured slow enough to need it).
+- `scripts/export_scene_dataset.py`: writes samples to disk as `.npy`
+  frames + a JSON metadata sidecar per index.
+
+Kept deliberately at 8 archetypes × 6 behaviors for this first pass (not
+154-scale) — see `SCENE_CATALOG_PLAN.md`'s scope note. Full suite (55
+tests, including both new regression hashes and the untouched
+`make_image` byte-exact regression) passes.
+
 ## 0.24.0
 
 Wires the two remaining standalone systems into `SceneGraph.update()`, so

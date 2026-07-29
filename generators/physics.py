@@ -7,6 +7,11 @@ the ``cx``/``cy``/``ground_y`` aliases (whichever is set wins in
 silently simulating a body whose position never visibly moves,
 ``add_body`` snapshots ``resolved_x``/``resolved_y`` into ``x``/``y`` and
 clears the aliases once, up front.
+
+``y`` follows the renderer's row convention (0 at the top, increasing
+downward — confirmed by ``_render_object``'s ``box_3d`` handling, where a
+taller box's top is ``y - height``). A **positive** ``gravity[1]`` therefore
+pulls bodies down the image, not negative.
 """
 
 from __future__ import annotations
@@ -55,7 +60,7 @@ class RayCastHit:
 
 
 class PhysicsWorld:
-    def __init__(self, gravity: tuple[float, float] = (0.0, -98.0)):
+    def __init__(self, gravity: tuple[float, float] = (0.0, 98.0)):
         self.gravity = gravity
         self._entries: list[tuple[ObjectSpec, RigidBodySpec]] = []
         self._velocities: dict[int, list[float]] = {}
@@ -65,6 +70,9 @@ class PhysicsWorld:
     @property
     def bodies(self) -> list[RigidBodySpec]:
         return [body for _, body in self._entries]
+
+    def has_body(self, obj: ObjectSpec) -> bool:
+        return any(o is obj for o, _ in self._entries)
 
     def add_body(self, obj: ObjectSpec, body: RigidBodySpec) -> None:
         obj.x, obj.y = obj.resolved_x, obj.resolved_y
@@ -219,20 +227,22 @@ def _ray_aabb(ox: float, oy: float, dx: float, dy: float, box: BoundingBox, max_
 
 
 if __name__ == "__main__":
-    world = PhysicsWorld(gravity=(0, -100))
+    world = PhysicsWorld(gravity=(0, 100))
     falling = ObjectSpec(kind="sphere_3d", x=0, y=100, radius=1, collision_shape=CollisionShape.NONE)
     world.add_body(falling, RigidBodySpec(mass=1.0))
     world.step(1.0)
-    assert falling.y < 100  # gravity pulled it down
+    assert falling.y > 100  # gravity pulled it down the image (y grows downward)
+    assert world.has_body(falling)
+    assert not world.has_body(ObjectSpec(kind="sphere_3d"))
 
     # cx/cy-built objects get normalized into x/y on add_body, or physics would
     # silently move a field resolved_x/y never reads.
     aliased = ObjectSpec(kind="sphere_3d", cx=0, cy=100, radius=1, collision_shape=CollisionShape.NONE)
-    alias_world = PhysicsWorld(gravity=(0, -100))
+    alias_world = PhysicsWorld(gravity=(0, 100))
     alias_world.add_body(aliased, RigidBodySpec(mass=1.0))
     assert aliased.cx is None and aliased.x == 0.0
     alias_world.step(1.0)
-    assert aliased.resolved_y < 100
+    assert aliased.resolved_y > 100
 
     ground = ObjectSpec(kind="box_3d", x=0, y=0, size=20, collision_shape=CollisionShape.AABB)
     ball = ObjectSpec(kind="sphere_3d", x=0, y=5, radius=2, collision_shape=CollisionShape.CIRCLE)
