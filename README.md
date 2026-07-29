@@ -1,13 +1,14 @@
 # Synthetic Image Generator
 
 `synthetic-image-generator` is a deterministic procedural image library with
-154 indexed content levels, composable scenes, transparency, resizing,
-quantization, dithering, packed pixel formats, and ordered batch generation.
-An optional scene-graph layer adds camera/physics/particles/tilemaps/HUD/
-tweens on top, for simple 2D games and interactive demos, and an indexed
-scene catalog (`make_scene_catalog`/`make_scene_trajectory`) applies the
-same `idx -> deterministic sample` schedule to whole scenes and their
-behaviors, for training data that needs more than one static composition.
+154 indexed content levels, native arbitrary-resolution rendering, composable
+scenes with procedural materials and semantic layout, 16 camera post-effects,
+transparency, resizing, quantization, dithering, packed pixel formats, and
+ordered batch generation. An optional scene-graph layer adds camera/viewport
+transforms with tracking and shake, physics, particles, tilemaps, HUD, tweens,
+session replay, and single-file HTML export. A 154-level indexed scene catalog
+applies the same `idx → deterministic sample` schedule to whole scenes and
+their dynamics — for training data that needs more than one static composition.
 
 The canonical indexed contract returns a NumPy `float32` RGB image with shape
 `(32, 32, 3)` and values in `[0, 1]`. A non-negative index always maps to the
@@ -16,10 +17,10 @@ same level and image for a fixed contract version.
 ## Installation
 
 ```bash
-python -m pip install -e .
+python -m pip install synthetic-image-generator
 ```
 
-Development dependencies and tests:
+From a repository checkout with dev dependencies:
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -32,8 +33,7 @@ Portable GPU acceleration is optional and does not require CUDA:
 python -m pip install -e ".[gpu]"
 ```
 
-From a repository checkout, atlas rendering additionally needs Pillow and
-Matplotlib:
+Atlas rendering needs Pillow and Matplotlib:
 
 ```bash
 python -m pip install -e ".[visualization]"
@@ -41,14 +41,24 @@ python scripts/render_generator_atlas.py
 python scripts/render_raster_atlas.py
 ```
 
-## Indexed images
+## Quick start
 
 ```python
 import synthetic_image_generator as sig
 
+# Indexed image — 32×32 float32 RGB (default, byte-exact contract)
 image = sig.make_image(42)
 assert image.shape == (32, 32, 3)
-assert image.dtype.name == "float32"
+
+# Native resolution — renders at the requested size, not upscaled
+native = sig.make_image(42, width=192, height=108)
+assert native.shape == (108, 192, 3)
+
+# Raster conversion with quantization and dithering
+rgb565 = sig.make_image(42, raster=sig.RasterSpec(
+    width=64, height=64, mode="rgb", bits_per_channel=(5, 6, 5), packed=True,
+))
+assert rgb565.shape == (64, 64)
 ```
 
 Indices are unbounded and cycle through the 154-level catalog:
@@ -58,7 +68,7 @@ level = sig.level_of(10_000_000)
 start = sig.level_start(level, cycle=3)
 ```
 
-The level schedule is `sig-154-cycle-v1`. The geometry changes between catalog
+The level schedule is `sig-154-cycle-v1`. Geometry changes between catalog
 cycles because the absolute block remains part of the deterministic seed.
 
 ## Batch generation
@@ -67,9 +77,12 @@ cycles because the absolute block remains part of the deterministic seed.
 repeated `make_image()` calls:
 
 ```python
-indices = range(10_000)
-batch = sig.make_images(indices, backend="auto")
+batch = sig.make_images(range(10_000), backend="auto")
 assert batch.shape == (10_000, 32, 32, 3)
+
+# Native-resolution batch
+batch = sig.make_images(range(100), width=96, height=64, backend="serial")
+assert batch.shape == (100, 64, 96, 3)
 ```
 
 Available backends:
@@ -80,193 +93,59 @@ Available backends:
 - `auto`: serial below 64 images, otherwise process-based parallelism under
   legacy fidelity; portable fidelity may select a hardware WebGPU adapter.
 
-The default `fidelity="legacy"` remains byte exact and does not silently switch
-to GPU arithmetic. GPU execution is explicit because transcendental operations
-can differ slightly across drivers:
+The default `fidelity="legacy"` remains byte exact. GPU execution is explicit
+because transcendental operations can differ across drivers:
 
 ```python
 info = sig.accelerator_info()
 if info["available"]:
-    batch = sig.make_images(
-        indices,
-        backend="webgpu",
-        fidelity="portable",
-    )
+    batch = sig.make_images(indices, backend="webgpu", fidelity="portable")
 ```
 
-The portable output is deterministic for a fixed adapter/driver. Portable
-WebGPU currently covers 25 levels in four reusable families:
-
-- Gray-Scott reaction-diffusion at level 113.
-- Primitive Render IR at levels 0–4, 6, 15–18, 128, 142, and 144. CPU planners
-  emit ordered rectangles, Bresenham lines, rotated ellipses, soft discs,
-  rings, clipping, additive/affine composition, and analytic Phong surfaces
-  for one generic WGSL interpreter.
-- Mirror, kaleidoscope, diffraction, displacement, and lens transforms at
-  levels 129, 130, 133, 135, and 136.
-- Plane waves at levels 148–153.
-
-Reaction-diffusion preserves the legacy RNG stream and offloads all 200–340
-simulation iterations. Primitive IR keeps random control flow on CPU and sends
-ordered pixel work to one generic WGSL interpreter—the same separation of
-control and parallel data work can be extended to more primitive-heavy levels.
-Mixed batches are grouped by family and restored to their original input order.
-Numerical validation uses `1e-4` absolute/relative tolerance on continuous
-paths and mean/percentile bounds where a tiny upstream difference can cross a
-later stochastic or hard threshold.
-
-Unsupported groups retain the CPU renderer. Heterogeneous batches select GPU
-families independently, submit remaining work to a persistent process pool
-created before driver initialization, and overlap both devices. Internally,
-RenderGraph v1 compiles each family into explicit `prepare → GPU → finish`
-dependencies. CPU preparation needed to feed the GPU is queued before unrelated
-CPU rendering, and independent branches are restored through one ordered
-assembly node. A second whole-batch performance gate prevents individually
-fast families from forming a slower combined schedule. `GPU_LEVEL_FAMILIES`
-exposes the current level-to-kernel registry.
-
-`accelerator_info()` never requires CUDA and reports the selected adapter,
-backend, and whether it is real hardware. Software adapters such as llvmpipe are
-rejected for normal acceleration. They can be enabled only for validation with
-`SIG_WEBGPU_ALLOW_SOFTWARE=1`. On a multi-GPU system,
-`SIG_WEBGPU_ADAPTER=amd` (or another case-insensitive vendor/device substring)
-selects a particular adapter; otherwise discrete and then integrated hardware
-are tried in priority order, with device-creation fallback between them.
-
-The process backend accepts `workers`, `chunksize`, and `start_method`.
-Leaving both `workers` and `chunksize` as `None` enables empirical CPU tuning
-for batches of at least 256 images. The tuner:
-
-- respects process affinity and cgroup CPU quotas;
-- detects physical cores, SMT capacity, and NUMA topology;
-- measures physical-core, partial-SMT, and full-SMT process counts;
-- measures chunk sizes and both one-thread and runtime-default BLAS policies;
-- samples the actual level/raster distribution rather than a synthetic loop;
-- caches the result for 15 minutes and reuses a warmed persistent process pool.
-
-Inspect the detected system and previous decisions with `sig.cpu_info()`.
-`SIG_CPU_AUTOTUNE=0` disables measurement, while explicit `workers=` or
-`chunksize=` values override that dimension. `SIG_CPU_WORKER_WARMUP=0` disables
-worker warmup for applications that prefer minimum startup work.
-
-On a single-threaded Linux parent, `start_method="auto"` uses `fork` to avoid
-reimporting the SciPy-heavy package; other environments use `spawn`. When
-called from a program that uses the multiprocessing `spawn` method, invoke it
-below the usual `if __name__ == "__main__":` guard. Nested daemon workers
-should use the serial backend and let their parent own the process pool.
-
-```python
-if __name__ == "__main__":
-    batch = sig.make_images(
-        range(50_000),
-        backend="process",
-        workers=None,
-        chunksize=None,
-    )
-    print(sig.cpu_info())
-```
-
-The GPU dependency remains optional; importing the package never initializes a
-graphics driver. If `backend="auto", fidelity="portable"` cannot see a hardware
-adapter, it safely retains the CPU path. For bulk batches, `auto` groups the
-real family distribution and performs adapter- and batch-scale-specific
-calibration against the configured CPU worker backend. It samples across the
-full input (up to 4,096 images), enables only families that pass numerical
-checks and a 1.10× speed gate, then applies the same gate to the complete
-hybrid schedule. The full 154-level catalog can therefore use GPU and CPU
-together when that exact distribution wins, while a different machine or
-batch safely remains process-only.
-
-Benchmark serial and process output, including a byte-exact equality check:
-
-```bash
-python scripts/benchmark_batch.py --count 3080
-```
-
-Benchmark the portable kernel separately:
-
-```bash
-python scripts/benchmark_batch.py \
-    --dataset accelerated --count 4096 --webgpu
-```
-
-Measured on this workspace with warmed pipelines:
-
-| Workload / adapter | WebGPU | CPU reference | Speedup |
-|---|---:|---:|---:|
-| 4,096 wave, NVIDIA Vulkan | 59,876 img/s | 17,938 img/s | 3.34× |
-| 4,096 wave, AMD Vulkan | 34,069 img/s | 17,980 img/s | 1.89× |
-| 4,096 wave, llvmpipe CPU | 10,034 img/s | 18,231 img/s | 0.55× |
-| 1,024 discrete IR, llvmpipe CPU | 1,317 img/s | 3,947 img/s | 0.33× |
-| 600 dense IR, llvmpipe CPU | 889 img/s | 1,298 img/s | 0.68× |
-| 1,950 analytic IR, llvmpipe CPU | 1,963 img/s | 5,686 img/s | 0.35× |
-| 1,024 reaction, NVIDIA Vulkan | 2,103 img/s | 1,060 img/s | 1.98× |
-| 4,096 wave+reaction mix, NVIDIA Vulkan | 12,380 img/s | 5,510 img/s | 2.25× |
-| 4,096 wave+reaction mix, AMD Vulkan | 10,141 img/s | 5,545 img/s | 1.83× |
-| 1,024 level-128 plans, NVIDIA Vulkan | 991 img/s | 825 img/s | 1.20× |
-| 1,024 level-128 plans, AMD Vulkan | 987 img/s | 855 img/s | 1.15× |
-| 4,096 previous 13-level mix, NVIDIA Vulkan | 10,738 img/s | 7,041 img/s | 1.53× |
-
-CPU autotuning on the workspace's Ryzen 9 7950X3D selected 16–24 processes
-and chunks of 4–8 depending on the measured run. Sustained full-catalog
-throughput reached 8,800–9,522 img/s, versus about 7,549 img/s for the previous
-fixed 16-process/chunk-32 policy. After that improvement, the full-catalog
-hybrid GPU schedule measured only 1.01× and was correctly rejected by the
-global 1.10× gate; `auto` retained the faster tuned CPU route.
-
-The software result is why normal discovery rejects CPU adapters and why
-portable `auto` uses a measured performance gate. Initial adapter creation,
-shader compilation, and automatic calibration are one-time costs; the table
-reports subsequent batch throughput.
+CPU autotuning (`workers=None`, `chunksize=None`, batches ≥256 images) respects
+process affinity, cgroup quotas, physical/SMT cores, and NUMA topology. Inspect
+the detected system with `sig.cpu_info()`.
 
 ### Environment variables
 
-Quick reference for the tuning knobs described above:
-
 | Variable | Default | Effect |
 |---|---|---|
-| `SIG_WEBGPU_ALLOW_SOFTWARE` | unset (off) | `1`/`true`/`yes`/`on` allows software adapters (e.g. llvmpipe) for validation; normal acceleration still rejects them. |
-| `SIG_WEBGPU_ADAPTER` | unset | Case-insensitive vendor/device substring (e.g. `amd`) to pick a specific adapter on multi-GPU systems. |
-| `SIG_CPU_AUTOTUNE` | `1` (on) | `0`/`false`/`no`/`off` disables empirical CPU worker/chunksize tuning; explicit `workers=`/`chunksize=` still override. |
-| `SIG_CPU_WORKER_WARMUP` | `1` (on) | `0`/`false`/`no`/`off` skips warming a render inside each new persistent worker process, for faster startup. |
+| `SIG_WEBGPU_ALLOW_SOFTWARE` | unset (off) | Allow software adapters (e.g. llvmpipe) for validation. |
+| `SIG_WEBGPU_ADAPTER` | unset | Vendor/device substring to pick a specific GPU. |
+| `SIG_CPU_AUTOTUNE` | `1` (on) | Disable empirical CPU worker/chunksize tuning. |
+| `SIG_CPU_WORKER_WARMUP` | `1` (on) | Skip warming a render inside each new worker process. |
 
 ## Structured scenes
 
 ```python
 from synthetic_image_generator import (
-    Background,
-    LightSpec,
-    ObjectSpec,
-    PostSpec,
-    SceneSpec,
-    make_scene,
+    Background, LightSpec, MaterialSpec, ObjectSpec,
+    LayoutRelation, LayoutSpec, SceneSpec, make_scene,
+)
+
+table = ObjectSpec(
+    kind="box_3d", name="table", x=16, y=22, width=14, height=3,
+    color=(0.45, 0.25, 0.1), material=MaterialSpec("wood", seed=3),
+)
+lamp = ObjectSpec(
+    kind="sphere_3d", name="lamp", x=16, y=15, size=4, radius=2,
+    color=(1.0, 0.75, 0.2), material=MaterialSpec("emissive"),
 )
 
 scene = SceneSpec(
-    background=Background(kind="gradient_sky", horizon=0.45),
-    objects=[
-        ObjectSpec(
-            kind="sphere_3d",
-            cx=16,
-            cy=18,
-            radius=5,
-            color=(0.2, 0.6, 1.0),
-        ),
-        ObjectSpec(
-            kind="building_3d",
-            x=8,
-            ground_y=24,
-            width=10,
-            height=15,
-            color=(0.8, 0.7, 0.5),
-        ),
-    ],
+    background=Background(kind="gradient_sky", horizon=0.5),
+    objects=[table, lamp],
     light=LightSpec(direction=(0.3, -0.6, 0.7)),
-    post=PostSpec(style="realistic", grain=0.1),
+    layout=LayoutSpec(relations=(
+        LayoutRelation("above", "lamp", "table", gap=1),
+    )),
 )
 
 image = make_scene(scene, seed=7)
 assert image.shape == (32, 32, 3)
+
+# High-resolution scene render
+hd = make_scene(scene, width=512, height=512)
 ```
 
 Objects are composed from far to near according to `depth`. Child reference
@@ -275,45 +154,104 @@ scene components are rejected before rendering.
 
 ### Procedural materials
 
-Geometric 3D objects can receive deterministic textures without an image
-asset pipeline:
+Nine deterministic materials, evaluated from NumPy without image assets:
+
+| Name | Look |
+|---|---|
+| `flat` | Uniform albedo (default) |
+| `wood` | Ring grain |
+| `brushed_metal` | Linear striations |
+| `marble` | Swirling veins |
+| `stone` | Irregular granular noise |
+| `concrete` | Speckled grey |
+| `fabric` | Fine weave |
+| `water` | Rippling caustics |
+| `emissive` | Glowing self-illumination |
+| `glass`  | Subtle refraction noise + opacity |
 
 ```python
-from synthetic_image_generator import MaterialSpec
-
-table = ObjectSpec(
-    kind="box_3d", x=16, y=20, size=12, color=(0.45, 0.25, 0.1),
-    material=MaterialSpec(name="wood", scale=1.2, rotation=15, seed=3),
+obj = ObjectSpec(
+    kind="sphere_3d", x=16, y=16, radius=8,
+    color=(0.2, 0.5, 0.3),
+    material=MaterialSpec(name="marble", scale=1.5, rotation=30, seed=7),
 )
 ```
 
-Available names are `flat`, `wood`, `brushed_metal`, `marble`, `stone`,
-`concrete`, `fabric`, `water`, and `emissive`. The material field is evaluated
-from NumPy only, so the same scene and seed always produce the same RGB field;
-existing `make_image` output remains unchanged.
+### Semantic layout
 
-For scene composition, `LayoutSpec` and `LayoutRelation` support deterministic
-constraints such as `left_of`, `right_of`, `above`, `below`, `behind`, and
-`in_front_of` between named objects. The resolver copies the scene, so caller
-objects are never mutated.
+`LayoutSpec` applies deterministic constraints between named objects without
+mutating the caller's spec:
 
-`scene_to_dict(scene)` and `scene_from_dict(data)` provide a JSON-compatible
-round trip for the complete declarative scene, including nested objects,
-materials, layers and layout. A running `SceneGraph` can additionally produce
-and restore a mutable checkpoint with `graph.snapshot()` and
-`graph.restore_snapshot(...)`, covering object positions, physics velocities,
-tween progress and the fixed-step clock.
+```python
+scene = SceneSpec(
+    objects=[left_box, right_box],
+    layout=LayoutSpec(relations=(
+        LayoutRelation("left_of", "left", "right", gap=2),
+    )),
+)
+```
+
+Supported relations: `left_of`, `right_of`, `above`, `below`, `behind`,
+`in_front_of`.
+
+### Serialization
+
+`scene_to_dict()` and `scene_from_dict()` provide a JSON-compatible round trip
+for the complete declarative scene, including nested objects, materials, layers,
+and layout:
+
+```python
+data = sig.scene_to_dict(scene)
+restored = sig.scene_from_dict(data)
+assert np.array_equal(sig.make_scene(scene), sig.make_scene(restored))
+```
+
+## Camera system
+
+The camera module provides tracking, cinematic transitions, screen shake, and
+16 post-effects — all deterministic and reusable outside the scene graph:
+
+```python
+from synthetic_image_generator import (
+    CameraSpec, update_camera_target, trigger_camera_shake,
+    transition_camera, apply_camera_effects,
+)
+
+cam = CameraSpec(
+    viewport_width=512, viewport_height=512,
+    world_x=300, world_y=220, zoom=1.0,
+    target="player", dead_zone=(8, 8), smoothing=0.8,
+    effects=("vignette", "film_grain"),
+)
+
+# Track a target with dead-zone and smoothing
+cam = update_camera_target(cam, objects, dt=1/60)
+
+# Trigger impact shake
+cam = trigger_camera_shake(cam, intensity=4.0, duration=0.25)
+
+# Cinematic transition
+cam = transition_camera(start_cam, end_cam, t=0.5, easing="smoothstep")
+```
+
+Post-effects (all 16): `vignette`, `grayscale`, `scanlines`, `flash`,
+`motion_blur`, `chromatic_aberration`, `pixelate`, `film_grain`,
+`depth_of_field`, `fog`, `underwater`, `night_vision`, `thermal`, `damage`,
+`rain`, `dust`.
+
+```bash
+python scripts/render_camera_effect_demos.py  # HTML gallery of all 16 effects
+```
 
 ## Scene graph / mini game engine
 
-An additive layer on top of `make_scene` adds camera/viewport transforms,
-named layers with parallax, sprite atlases, a particle system, lightweight
-2D physics, an input abstraction (with deterministic replay), a
-fixed-timestep game loop, a HUD/widget system, tweens, tilemaps, session
-record/replay, and a single-file HTML export. Every piece is a satellite
-module that either never imports the renderer or only calls the public
-`make_scene`/`make_scene_raster` functions like any other caller, so the
-indexed contract and existing `make_scene` calls are unaffected.
+An additive layer on top of `make_scene` adds camera/viewport transforms with
+tracking/shake/transitions, named layers with parallax, sprite atlases, a
+particle system, lightweight 2D physics, an input abstraction (with
+deterministic replay), a fixed-timestep game loop, a HUD/widget system, tweens,
+tilemaps, session record/replay, and a single-file HTML export. Every piece
+calls only the public `make_scene`/`make_scene_raster` functions; the indexed
+contract is unaffected.
 
 ```python
 from synthetic_image_generator import (
@@ -321,233 +259,151 @@ from synthetic_image_generator import (
     RigidBodySpec, SceneGraph, SceneSpec,
 )
 
-ground = ObjectSpec(kind="box_3d", x=16, y=28, size=32, collision_shape=CollisionShape.AABB)
-ball = ObjectSpec(kind="sphere_3d", x=16, y=4, radius=3, collision_shape=CollisionShape.CIRCLE, name="ball")
+ground = ObjectSpec(kind="box_3d", x=16, y=28, size=4, collision_shape=CollisionShape.AABB)
+ball = ObjectSpec(kind="sphere_3d", name="ball", x=16, y=4, radius=3,
+                  collision_shape=CollisionShape.CIRCLE)
 
-physics = PhysicsWorld(gravity=(0, 50))  # positive y falls down the image
+physics = PhysicsWorld(gravity=(0, 50))
 physics.add_body(ground, RigidBodySpec(is_static=True))
 physics.add_body(ball, RigidBodySpec(mass=1.0, restitution=0.4))
 
 graph = SceneGraph(
     scene_spec=SceneSpec(objects=[ground, ball]),
-    camera=CameraSpec(viewport_width=64, viewport_height=64),
-    physics=physics,
-    seed=7,
+    camera=CameraSpec(viewport_width=512, viewport_height=512,
+                      world_x=16, world_y=16, effects=("vignette",)),
+    physics=physics, seed=7,
 )
 
-frame = graph.tick(1 / 60, InputState())
-assert frame.shape == (64, 64, 4)
+frame = graph.tick(1/60, InputState())
+assert frame.shape == (512, 512, 4)
 ```
 
-`SceneGraph.update()` (called once per fixed step inside `tick()`) drives
-physics, `animations` (`Tween`/`AnimationTrack`), particle auto-emission for
-any `ParticlePool` with an `origin` set, flipbook playback, and HUD click
-dispatch. `SceneGraph.render()` composites, bottom to top: `tilemaps` ->
-the scene (per-`layer` via `LayerManager` if any are registered, otherwise
-one `make_scene` call) -> sprite-tagged objects (`ObjectSpec.sprite`/
-`flipbook`) -> particles -> `hud`, into one RGBA frame.
+`SceneGraph.update()` drives physics, animations, particles, flipbook playback,
+camera tracking, shake decay, and cinematic transitions.
+`SceneGraph.render()` composites: tilemaps → scene → sprites → particles → HUD.
 
-This layer targets game-loop convenience, not conservation-grade physics or
-pixel-identical browser rendering — `export_html` draws flat-shaded 2D proxy
-shapes with a small interactive JS loop, not a port of the Phong-shaded 3D
-renderer.
+### Snapshot and restore
 
-```bash
-python scripts/render_scene_graph_demos.py   # writes media/scene_graph_demos/index.html
-```
-
-Generates a few `export_html` scenes (platformer, shapes reference, top-down
-arena) plus a gallery page that embeds them all in `<iframe>`s to click
-around in a browser. `media/` is gitignored except for the two committed
-atlas PNGs below, so this directory only exists locally after you run the
-script.
-
-See [`SCENE_GRAPH_PLAN.md`](SCENE_GRAPH_PLAN.md) for the design
-rationale and [`CHANGELOG.md`](CHANGELOG.md) (0.10.0 onward) for what each
-phase added. It sits outside the byte-exact policy in
-[`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md), which covers `make_image`'s
-indexed contract only.
-
-## Scene catalog
-
-Para inspeccionar los arquetipos como mini-simulaciones interactivas del
-`SceneGraph`, ejecuta:
-
-```bash
-python scripts/render_scene_archetype_demos.py
-```
-
-Esto genera `media/scene_archetype_demos/index.html`, con una tarjeta por cada
-uno de los 48 arquetipos y sus controles de simulación.
-
-Para inspeccionar los efectos visuales de cámara:
-
-```bash
-python scripts/render_camera_effect_demos.py
-```
-
-Esto genera `media/camera_effect_demos/index.html` con variantes reales de
-viñeta, grayscale, scanlines, flash, motion blur, aberración cromática,
-pixelado y grano de película.
-
-La galería de arquetipos reproduce ahora 12 frames por escena generados por el
-renderer Python real. No usa el canvas proxy JS como vista principal; el proxy
-sólo debe considerarse una herramienta experimental para interacción web.
-
-Para entrenamiento temporal usa el exportador de secuencias largas:
-
-```bash
-python scripts/export_scene_training_dataset.py --quality training
-```
-
-La política usa 1 frame para escenas estáticas, 120 para tweens/caídas, 180
-para partículas, patrol, chase y rebotes, y 240 para física y órbitas. `fast`
-limita las secuencias a 60 frames y `preview` a 12. El manifiesto incluye
-clasificación `static`, `loop` o `evolving`, repeticiones detectadas y
-desplazamiento máximo.
-
-Las escenas también pueden renderizarse con una salida mayor que la imagen
-legacy de 32×32. `SceneGraph` separa el mundo de la cámara y del raster:
+Capture and restore mutable simulation state:
 
 ```python
-graph.camera.viewport_width = 512
-graph.camera.viewport_height = 512
-graph.camera.world_x = 300
-graph.camera.world_y = 220
-frame = graph.render()  # (512, 512, 4)
+checkpoint = graph.snapshot()
+# ... simulate many steps ...
+graph.restore_snapshot(checkpoint)
 ```
 
-Para generar vistas panorámicas reproducibles usa
-`make_scene_camera_trajectory(idx, n_frames=120)`. La cámara se desplaza sin
-mutar la especificación compartida del catálogo.
+Covers: object positions, physics velocities, tween progress, particle state,
+camera pose, and the fixed-step clock.
 
-The scene-level catalog exposes 154 deterministic entries backed by 48 reusable
-archetypes. Use `scene_level_spec(idx)` to inspect the declarative contract,
-`make_scene_level(idx)` for one RGBA frame, and
-`make_scene_trajectory_level(idx)` for a reproducible fixed-step trajectory.
-`scene_level_start(level, cycle=1)` selects the same structural level in a later
-seed cycle without repeating its geometry.
-
-The same `idx -> deterministic sample` schedule `make_image`/`LEVEL_TABLE`
-use for indexed images, applied to whole scenes and their dynamics:
+### HTML export
 
 ```python
-from synthetic_image_generator import make_scene_catalog, make_scene_trajectory
-
-sample = make_scene_catalog(42)  # one composed scene, like make_image(idx)
-assert sample.frames[0].shape == (32, 32, 4)
-assert sample.archetype and sample.seed == 42
-
-trajectory = make_scene_trajectory(42, n_frames=60)  # 60 deterministic frames
-assert len(trajectory.frames) == 60
-assert trajectory.behaviors  # e.g. ["patrol", "gravity_drop"]
+sig.export_live_html(graph, "demo.html", width=512, height=512)
 ```
 
-`make_scene_catalog(idx)` resolves to one of `SCENE_ARCHETYPES` (composition
-only: object kinds/positions/tags, no physics/behaviors attached) and
-renders one settled frame. `make_scene_trajectory(idx, n_frames=...)` also
-attaches 1-3 behaviors from `BEHAVIORS` compatible with that archetype
-(`patrol`, `chase`, `flee`, `orbit`, `gravity_drop`, `bounce_particles`) and
-ticks the scene forward, recording every frame plus per-object labels
-(`SceneSample.objects_state`, tags + bounding box) and events
-(`SceneSample.events`, physics contacts + HUD clicks) — the same
-`SceneSample` shape works as a detection-label source, an RL trajectory, or
-a world-model replay target, so no consumer has to be picked in advance.
-Both functions are regression-gated (`SCENE_CATALOG_SAMPLE_SHA256`/
-`SCENE_TRAJECTORY_SAMPLE_SHA256`) the same way the indexed image catalog is,
-under an independent contract (`SCENE_CATALOG_CONTRACT_VERSION`) that never
-touches `make_image`'s. See [`SCENE_CATALOG_PLAN.md`](SCENE_CATALOG_PLAN.md)
-for the full design and `scripts/export_scene_dataset.py` for writing a
-batch of samples to disk.
+Draws flat-shaded 2D proxy shapes with an interactive JS loop — not a port of
+the Phong-shaded 3D renderer, but sufficient for prototyping and demos.
+
+```bash
+python scripts/render_scene_graph_demos.py  # → media/scene_graph_demos/
+```
+
+## Scene level catalog
+
+A 154-entry deterministic catalog built from 48 reusable archetypes × 7
+variants × 7 visual styles × 9 simulation modes:
+
+| Category | Archetypes | Count |
+|---|---|---|
+| Visual | abstract_shapes, geometric_stack, symmetry_scene, pattern_grid, empty_minimal, gradient_environment | 6 |
+| Objects | single_sphere/box/tube/blob/emissive/transparent, object_row/grid/stack/cluster/scatter/pile | 12 |
+| Environment | grass_field, forest, tree_cluster, flower_field, mountain_landscape, underwater_scene | 6 |
+| Built | room, building_block, city_block, bridge_scene, warehouse, street_scene | 6 |
+| Character | single_character, character_pair, character_group, animal_group, predator_prey, crowd_scene | 6 |
+| Physics | physics_playground, stacked_objects, falling_objects, bouncing_objects, orbiting_bodies, pendulum_or_chain | 6 |
+| System | particle_emitter, particle_burst, fluid_like_field, reaction_diffusion, tilemap_maze, platformer_level | 6 |
+
+Simulation modes: `static`, `tweened`, `physics`, `particles`, `orbit`,
+`patrol`, `bounce`, `fall`, `chase`.
+
+```python
+# Single frame
+frame = sig.make_scene_level(sig.scene_level_start(42))
+assert frame.shape[2] == 4  # RGBA
+
+# Full trajectory
+sample = sig.make_scene_trajectory_level(
+    sig.scene_level_start(42), n_frames=60,
+)
+
+# Training trajectory (policy: 1–240 frames depending on simulation)
+sample = sig.make_scene_training_trajectory(
+    sig.scene_level_start(42), quality="training",
+)
+
+# Camera trajectory (14 modes: pan, zoom, orbit, follow, dolly, rail, …)
+frames = sig.make_scene_camera_trajectory(
+    sig.scene_level_start(18), n_frames=120, mode="pan",
+)
+```
+
+Inspect the catalog:
+
+```python
+spec = sig.scene_level_spec(idx)             # SceneLevelSpec
+name = sig.scene_level_by_name("forest_small")
+category = sig.scene_archetype_category("forest")  # "environment"
+```
+
+Quality and diversity diagnostics:
+
+```python
+report = sig.scene_quality_report(sig.scene_level_start(0))
+diversity = sig.scene_diversity_report()
+reports = sig.validate_scene_quality()
+```
+
+Demos and datasets:
+
+```bash
+python scripts/render_scene_archetype_demos.py    # Interactive HTML (48 archetypes)
+python scripts/render_scene_level_gallery.py      # Grid gallery (154 levels)
+python scripts/export_scene_training_dataset.py   # .npz trajectories + manifest
+```
+
+The scene level catalog has its own contract version
+(`SCENE_LEVEL_CONTRACT_VERSION`) and regression hashes
+(`SCENE_LEVEL_SAMPLE_SHA256`, `SCENE_LEVEL_TRAJECTORY_SAMPLE_SHA256`)
+independent from `make_image`'s indexed contract.
+
+### Legacy scene catalog
+
+The older `make_scene_catalog(idx)` and `make_scene_trajectory(idx)` (from
+`scene_catalog.py`) remain available. The scene level catalog above is the
+recommended replacement.
 
 ## Raster output
 
-Indexed images and structured scenes render natively at the requested
-resolution; dimensions are no longer produced by enlarging a 32×32 render.
-For float32 RGB output, pass `width` and `height` directly:
+Native canvases support 32–4096 pixels per axis and at most 8,388,608 total
+pixels. A `RasterSpec` with both axes ≥32 px drives the native render canvas
+before color conversion and quantization. Outputs smaller than 32 px on either
+axis are safely reduced from 32×32.
 
-```python
-native = make_image(42, width=192, height=108)
-assert native.shape == (108, 192, 3)
-assert native.dtype.name == "float32"
-```
+Supported modes: `rgb`, `rgba`, `rgba2222` (packed), `grayscale`, `binary`.
 
-Both dimensions must be supplied together. Native canvases support
-32–4096 pixels per axis and at most 8,388,608 total pixels. The default
-remains byte-exact 32×32 output. Coordinates in `SceneSpec` remain canonical
-32×32 coordinates and are scaled non-destructively to the native canvas.
-
-`RasterSpec.width` is the X resolution and `height` is the Y resolution. A
-RasterSpec whose axes are at least 32 pixels drives the native render canvas
-before color conversion and quantization:
-
-```python
-from synthetic_image_generator import RasterSpec, make_image
-
-rgb8 = make_image(
-    42,
-    raster=RasterSpec(
-        width=128,
-        height=64,
-        mode="rgb",
-        bits_per_channel=8,
-    ),
-)
-assert rgb8.shape == (64, 128, 3)
-assert rgb8.dtype.name == "uint8"
-```
-
-Supported modes:
-
-- `rgb` and `rgba`, with 1–16 bits per channel.
-- `rgba2222`, packed as `RR GG BB AA`.
-- `grayscale`.
-- `binary`, optionally packed eight horizontal pixels per byte.
-
-Resize methods are `nearest`, `bilinear`, and `bicubic`. Dithering methods are
-`none`, `ordered`, and `floyd_steinberg`. RGB/RGBA channel tuples can be packed,
-for example `(5, 6, 5)` for RGB565.
-
-For compatibility, raster outputs smaller than 32 pixels on either axis are
-generated by reducing the safe 32×32 native canvas. This is the only indexed
-generation path that spatially resizes; `convert_raster()` can also be used
-directly when explicit conversion of an existing image is desired.
-
-```python
-rgb565 = make_image(
-    42,
-    raster=RasterSpec(
-        width=64,
-        height=64,
-        mode="rgb",
-        bits_per_channel=(5, 6, 5),
-        packed=True,
-    ),
-)
-assert rgb565.shape == (64, 64)
-assert rgb565.dtype.name == "uint16"
-```
+Resize methods: `nearest`, `bilinear`, `bicubic`. Dithering: `none`, `ordered`,
+`floyd_steinberg`. RGB/RGBA channel tuples can be packed, e.g. `(5, 6, 5)` for
+RGB565.
 
 Transparent scenes use premultiplied-alpha resizing to avoid dark sprite edges:
 
 ```python
-sprite_scene = SceneSpec(
+scene = SceneSpec(
     background=Background(kind="transparent"),
-    objects=[
-        ObjectSpec(
-            kind="disc_with_rim",
-            x=16,
-            y=16,
-            radius=7,
-            color=(1.0, 0.2, 0.1),
-            opacity=0.75,
-        )
-    ],
+    objects=[ObjectSpec(kind="disc_with_rim", x=16, y=16, radius=7,
+                        color=(1.0, 0.2, 0.1), opacity=0.75)],
 )
-sprite = make_scene(
-    sprite_scene,
-    raster=RasterSpec(width=64, height=64, mode="rgba"),
-)
+sprite = make_scene(scene, raster=RasterSpec(width=64, height=64, mode="rgba"))
 assert sprite.shape == (64, 64, 4)
 ```
 
@@ -560,24 +416,40 @@ generation should use `make_images(..., backend="process")`, where every worker
 owns independent state.
 
 The regression suite verifies one byte-exact sample from every level against
-`LEGACY_LEVEL_SAMPLE_SHA256`, alongside thread, process, raster, scene, and API
-tests. The scene catalog has its own independent pair of regression hashes
-(`SCENE_CATALOG_SAMPLE_SHA256`, `SCENE_TRAJECTORY_SAMPLE_SHA256`, one sample
-per archetype each) so a change there can never silently pass by relying on
-the indexed-image regression covering it.
+`LEGACY_LEVEL_SAMPLE_SHA256`, alongside thread, process, raster, scene, native
+resolution, and scene-level-catalog tests (~100 tests).
 
 ## Source layout
 
 `pyproject.toml` maps the physical `generators/` directory directly to the
 installed `synthetic_image_generator` namespace. There is no duplicated package
-source. The distribution includes a `py.typed` marker for type-aware tooling.
+source. The distribution includes a `py.typed` marker.
 
-The generated atlases are available in:
+| Module | Purpose |
+|---|---|
+| `synthetic_image_generator.py` | Indexed image renderer (154 levels) + `make_image`/`make_scene` entry points |
+| `levels.py` | Canonical level catalog and index schedule |
+| `scene_spec.py` | Declarative scene types (`SceneSpec`, `ObjectSpec`, `RasterSpec`, `MaterialSpec`, `LayoutSpec`, …) |
+| `materials.py` | Nine procedural materials (wood, marble, metal, …) |
+| `layout.py` | Semantic layout constraint resolver |
+| `camera.py` | Camera tracking, shake, transitions, 16 post-effects |
+| `scene_graph.py` | Spatial queries and bounding-box helpers |
+| `game_loop.py` | `SceneGraph` — fixed-step game loop, snapshot/restore |
+| `scene_level_catalog.py` | 154-entry scene level catalog with simulations and camera trajectories |
+| `scene_serialization.py` | JSON round-trip for `SceneSpec` |
+| `scene_catalog.py` | Legacy scene catalog (pre-0.26.0) |
+| `_primitive_ir.py` / `_rendergraph.py` | WebGPU RenderGraph IR and compiler |
+| `wave.py` | Plane-wave cross-modal levels (148–153) |
+| `physics.py` / `tween.py` / `particles.py` / `tilemap.py` / `ui.py` / `layers.py` | Satellite game-loop modules |
+| `_webgpu.py` | WebGPU acceleration backend |
+| `web_export.py` | Single-file HTML export |
+| `input_system.py` / `replay.py` | Input abstraction and deterministic replay |
+
+Generated atlases:
 
 - [`media/synthetic_generator_universal_atlas.png`](media/synthetic_generator_universal_atlas.png)
 - [`media/synthetic_generator_raster_atlas.png`](media/synthetic_generator_raster_atlas.png)
 
-See [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) for the canonical-source and
-contract policy, [`OPTIMIZATION_PLAN.md`](OPTIMIZATION_PLAN.md) for the
-CPU/WebGPU RenderGraph roadmap, and [`CHANGELOG.md`](CHANGELOG.md) for release
-changes.
+See [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md) for the canonical-source policy,
+[`CHANGELOG.md`](CHANGELOG.md) for release notes, and
+[`OPTIMIZATION_PLAN.md`](OPTIMIZATION_PLAN.md) for the WebGPU roadmap.
