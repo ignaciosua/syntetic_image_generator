@@ -214,6 +214,17 @@ portable `auto` uses a measured performance gate. Initial adapter creation,
 shader compilation, and automatic calibration are one-time costs; the table
 reports subsequent batch throughput.
 
+### Environment variables
+
+Quick reference for the tuning knobs described above:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SIG_WEBGPU_ALLOW_SOFTWARE` | unset (off) | `1`/`true`/`yes`/`on` allows software adapters (e.g. llvmpipe) for validation; normal acceleration still rejects them. |
+| `SIG_WEBGPU_ADAPTER` | unset | Case-insensitive vendor/device substring (e.g. `amd`) to pick a specific adapter on multi-GPU systems. |
+| `SIG_CPU_AUTOTUNE` | `1` (on) | `0`/`false`/`no`/`off` disables empirical CPU worker/chunksize tuning; explicit `workers=`/`chunksize=` still override. |
+| `SIG_CPU_WORKER_WARMUP` | `1` (on) | `0`/`false`/`no`/`off` skips warming a render inside each new persistent worker process, for faster startup. |
+
 ## Structured scenes
 
 ```python

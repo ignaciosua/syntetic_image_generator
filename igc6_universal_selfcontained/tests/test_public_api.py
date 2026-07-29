@@ -726,6 +726,72 @@ def test_integer_alpha_and_stricter_raster_validation():
         )
 
 
+def test_wave_video_and_audio_render_consistently_with_theta():
+    from synthetic_image_generator import wave
+
+    lvl, (n, mode) = next(iter(wave.WAVE_LEVELS.items()))
+    th = wave.theta(lvl * 325)
+
+    video = wave.render_video(th, n, mode, n_frames=8)
+    audio = wave.render_audio(th, n, mode, n_samples=4000)
+
+    assert video.shape == (32, 32, 3, 8)
+    assert video.dtype == np.float32
+    assert -1e-6 <= video.min() and video.max() <= 1 + 1e-6
+    assert np.abs(np.diff(video, axis=-1)).mean() > 1e-3  # waves actually travel
+
+    assert audio.shape == (4000,)
+    assert audio.dtype == np.float32
+    assert -1 - 1e-6 <= audio.min() and audio.max() <= 1 + 1e-6
+    assert np.abs(audio).max() > 0.3  # not silent
+
+    # same theta -> same output, every time
+    assert np.array_equal(video, wave.render_video(th, n, mode, n_frames=8))
+    assert np.array_equal(audio, wave.render_audio(th, n, mode, n_samples=4000))
+
+
+def test_raster_floyd_steinberg_dither_with_bicubic_resize():
+    image = sig.make_image(123)
+    raster = sig.RasterSpec(
+        width=17, height=11, mode="rgb", bits_per_channel=4,
+        resize="bicubic", dither="floyd_steinberg",
+    )
+    result = sig.convert_raster(image, raster)
+
+    assert result.shape == (11, 17, 3)
+    assert result.dtype == np.uint8
+    assert result.min() >= 0 and result.max() <= 15  # 4 bits/channel
+
+    # dithering must actually diffuse error: "none" would band identical
+    # regions to the same flat level, floyd_steinberg breaks that up.
+    none_raster = sig.RasterSpec(
+        width=17, height=11, mode="rgb", bits_per_channel=4,
+        resize="bicubic", dither="none",
+    )
+    result_none = sig.convert_raster(image, none_raster)
+    assert not np.array_equal(result, result_none)
+
+    # deterministic given the same inputs
+    assert np.array_equal(result, sig.convert_raster(image, raster))
+
+
+def test_extract_alpha_background_matte_separates_subject_from_backdrop():
+    sprite_level = 90
+    image = sig.make_image(0, force_level=sprite_level)
+
+    matte = sig.extract_alpha(image, "background", level=sprite_level)
+
+    assert matte.shape == (32, 32)
+    assert matte.dtype == np.float32
+    assert 0.0 <= matte.min() and matte.max() <= 1.0
+    assert matte.std() > 0.01  # not a flat/trivial mask
+
+    # opaque and luminance modes must disagree with the background matte on
+    # the same image -- otherwise "background" isn't doing anything distinct.
+    opaque = sig.extract_alpha(image, "opaque")
+    assert not np.array_equal(matte, opaque)
+
+
 def test_scene_validation_rejects_bad_seeds_and_cycles():
     with pytest.raises(TypeError):
         sig.make_scene(sig.SceneSpec(), seed=True)
