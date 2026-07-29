@@ -1724,7 +1724,6 @@ def _render_image(idx: int, step: int = 7, force_level: int | None = None) -> np
     Returns:
         float32 numpy array of shape (32, 32, 3), values in [0, 1].
     """
-    rng = _rng(idx)
     img = np.zeros((H, W, C), np.float32)
     block = _level_block(idx)
     lvl = _level_of(idx)
