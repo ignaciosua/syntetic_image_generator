@@ -4,7 +4,10 @@
 154 indexed content levels, composable scenes, transparency, resizing,
 quantization, dithering, packed pixel formats, and ordered batch generation.
 An optional scene-graph layer adds camera/physics/particles/tilemaps/HUD/
-tweens on top, for simple 2D games and interactive demos.
+tweens on top, for simple 2D games and interactive demos, and an indexed
+scene catalog (`make_scene_catalog`/`make_scene_trajectory`) applies the
+same `idx -> deterministic sample` schedule to whole scenes and their
+behaviors, for training data that needs more than one static composition.
 
 The canonical indexed contract returns a NumPy `float32` RGB image with shape
 `(32, 32, 3)` and values in `[0, 1]`. A non-negative index always maps to the
@@ -316,7 +319,19 @@ one `make_scene` call) -> sprite-tagged objects (`ObjectSpec.sprite`/
 This layer targets game-loop convenience, not conservation-grade physics or
 pixel-identical browser rendering — `export_html` draws flat-shaded 2D proxy
 shapes with a small interactive JS loop, not a port of the Phong-shaded 3D
-renderer. See [`SCENE_GRAPH_PLAN.md`](SCENE_GRAPH_PLAN.md) for the design
+renderer.
+
+```bash
+python scripts/render_scene_graph_demos.py   # writes media/scene_graph_demos/index.html
+```
+
+Generates a few `export_html` scenes (platformer, shapes reference, top-down
+arena) plus a gallery page that embeds them all in `<iframe>`s to click
+around in a browser. `media/` is gitignored except for the two committed
+atlas PNGs below, so this directory only exists locally after you run the
+script.
+
+See [`SCENE_GRAPH_PLAN.md`](SCENE_GRAPH_PLAN.md) for the design
 rationale and [`CHANGELOG.md`](CHANGELOG.md) (0.10.0 onward) for what each
 phase added. It sits outside the byte-exact policy in
 [`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md), which covers `make_image`'s
@@ -435,7 +450,10 @@ owns independent state.
 
 The regression suite verifies one byte-exact sample from every level against
 `LEGACY_LEVEL_SAMPLE_SHA256`, alongside thread, process, raster, scene, and API
-tests.
+tests. The scene catalog has its own independent pair of regression hashes
+(`SCENE_CATALOG_SAMPLE_SHA256`, `SCENE_TRAJECTORY_SAMPLE_SHA256`, one sample
+per archetype each) so a change there can never silently pass by relying on
+the indexed-image regression covering it.
 
 ## Source layout
 
