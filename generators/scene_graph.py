@@ -31,12 +31,14 @@ def object_aabb(obj: ObjectSpec) -> BoundingBox:
     return BoundingBox(cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 
 
-def _flatten(objects: list[ObjectSpec]) -> list[ObjectSpec]:
+def flatten_objects(objects: list[ObjectSpec]) -> list[ObjectSpec]:
+    """Return objects in stable depth-first order, including all descendants."""
+
     flat: list[ObjectSpec] = []
     for obj in objects:
         flat.append(obj)
         if obj.children:
-            flat.extend(_flatten(obj.children))
+            flat.extend(flatten_objects(obj.children))
     return flat
 
 
@@ -44,7 +46,7 @@ class SceneQuery:
     """Spatial/tag lookups over a snapshot of a scene's objects."""
 
     def __init__(self, scene: SceneSpec):
-        self._objects = _flatten(list(scene.objects))
+        self._objects = flatten_objects(list(scene.objects))
 
     def at_point(self, x: float, y: float) -> list[ObjectSpec]:
         return [o for o in self._objects if object_aabb(o).contains(x, y)]

@@ -423,7 +423,7 @@ def export_live_html(
                     "loop": tw.loop,
                     "pingPong": tw.ping_pong,
                     "elapsed": tw.elapsed,
-                    "reversed": False,
+                    "reversed": tw.reversed,
                 })
         elif hasattr(track, "chaser_name"):
             query = SceneQuery(scene_graph.scene_spec)
@@ -454,8 +454,8 @@ def export_live_html(
                 "restitution": body.restitution,
                 "linearDamping": body.linear_damping,
                 "gravityScale": body.gravity_scale,
-                "vx": body.velocity[0],
-                "vy": body.velocity[1],
+                "vx": scene_graph.physics.velocity(obj)[0],
+                "vy": scene_graph.physics.velocity(obj)[1],
             }
             for obj, body in scene_graph.physics.entries()
         ]

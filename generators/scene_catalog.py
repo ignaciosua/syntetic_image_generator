@@ -50,6 +50,7 @@ class SceneSample:
     objects_state: list[dict]
     events: list[dict]
     input_log: list[InputState] | None = None
+    metadata: dict = field(default_factory=dict)
 
 
 def _validate_idx(idx: int) -> None:

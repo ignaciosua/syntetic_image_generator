@@ -49,6 +49,9 @@ class RasterSpec:
     """Requested spatial resolution, color mode, and channel precision.
 
     ``width`` is the X resolution and ``height`` is the Y resolution.
+    Indexed images and structured scenes render natively at these dimensions
+    when both axes are at least 32 pixels; smaller raster outputs preserve the
+    legacy contract by reducing the safe 32×32 canvas.
     ``bits_per_channel`` may be one integer or a channel tuple such as
     ``(5, 6, 5)``. ``alpha_mode`` controls how RGB-only indexed images acquire
     transparency when an RGBA output is requested.
@@ -124,6 +127,17 @@ class FlipbookClip:
     loop: bool = True
 
 
+@dataclass(frozen=True)
+class MaterialSpec:
+    """Procedural material parameters for a structured scene object."""
+
+    name: str = "flat"
+    scale: float = 1.0
+    rotation: float = 0.0
+    strength: float = 0.35
+    seed: int = 0
+
+
 @dataclass
 class ObjectSpec:
     """One independently positioned scene object.
@@ -143,6 +157,7 @@ class ObjectSpec:
     depth_3d: float | None = None
     size: float = 8.0
     color: Color | None = None
+    material: MaterialSpec | None = None
     yaw: float | None = None
     pitch: float | None = None
     shape_type: int | None = None
@@ -196,6 +211,22 @@ class Layer:
     visible: bool = True
 
 
+@dataclass(frozen=True)
+class LayoutRelation:
+    """Semantic placement constraint between two named objects."""
+    relation: str
+    source: str
+    target: str
+    gap: float = 1.0
+
+
+@dataclass(frozen=True)
+class LayoutSpec:
+    """Deterministic, lightweight scene-layout constraints."""
+    relations: tuple[LayoutRelation, ...] = ()
+    iterations: int = 2
+
+
 @dataclass
 class SceneSpec:
     """A complete composable scene."""
@@ -205,6 +236,7 @@ class SceneSpec:
     light: LightSpec = field(default_factory=LightSpec)
     post: PostSpec = field(default_factory=PostSpec)
     layers: dict[str, Layer] = field(default_factory=dict)
+    layout: LayoutSpec | None = None
 
 
 if __name__ == "__main__":

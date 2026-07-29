@@ -31,15 +31,18 @@ import numpy as np
 
 from .atlas import AtlasSpec, flipbook_region, stamp_sprite
 from .camera import CameraSpec, world_to_screen
+from .camera import (update_camera_target, update_camera_shake, apply_camera_effects,
+                     trigger_camera_shake, transition_camera)
 from .input_system import InputState
 from .layers import LayerManager
 from .particles import ParticlePool
 from .physics import PhysicsWorld
-from .scene_graph import SceneQuery
+from .scene_graph import SceneQuery, flatten_objects
 from .scene_spec import ObjectSpec, RasterSpec, SceneSpec
 from .synthetic_image_generator import make_scene
 from .tilemap import TilemapRenderer, TilemapSpec
 from .tween import AnimationTrack, Updatable
+from .scene_serialization import scene_from_dict, scene_to_dict
 from .ui import HUD
 
 
@@ -87,6 +90,29 @@ def _split_sprite_objects(objects: list[ObjectSpec]) -> tuple[list[ObjectSpec], 
     return renderer_objects, sprite_objects
 
 
+def _camera_object(obj: ObjectSpec, camera: CameraSpec) -> ObjectSpec:
+    """Project world coordinates into the renderer's logical 32x32 canvas."""
+    logical_w, logical_h = 32.0, 32.0
+    sx = (obj.resolved_x - camera.world_x) * camera.zoom + camera.viewport_width / 2.0
+    sy = (obj.resolved_y - camera.world_y) * camera.zoom + camera.viewport_height / 2.0
+    scale = min(logical_w / camera.viewport_width, logical_h / camera.viewport_height) * camera.zoom
+    projected = dataclasses.replace(
+        obj, x=sx * logical_w / camera.viewport_width, y=sy * logical_h / camera.viewport_height,
+        cx=None, cy=None, ground_y=None,
+        radius=obj.radius * scale, size=obj.size * scale,
+        width=None if obj.width is None else obj.width * scale,
+        height=None if obj.height is None else obj.height * scale,
+        children=[_camera_object(child, camera) for child in obj.children],
+    )
+    return projected
+
+
+def _camera_scene(scene: SceneSpec, camera: CameraSpec) -> SceneSpec:
+    if camera.viewport_width == 32 and camera.viewport_height == 32 and camera.world_x == 0 and camera.world_y == 0 and camera.zoom == 1:
+        return scene
+    return dataclasses.replace(scene, objects=[_camera_object(obj, camera) for obj in scene.objects])
+
+
 @dataclass
 class SceneGraph:
     scene_spec: SceneSpec = field(default_factory=SceneSpec)
@@ -103,14 +129,11 @@ class SceneGraph:
     last_hud_events: list[str] = field(default_factory=list, init=False, repr=False)
     last_contacts: list = field(default_factory=list, init=False, repr=False)
     _particle_rngs: dict = field(default_factory=dict, init=False, repr=False)
+    _camera_transition: tuple | None = field(default=None, init=False, repr=False)
 
     @property
     def objects(self) -> list[ObjectSpec]:
-        flat: list[ObjectSpec] = []
-        for obj in self.scene_spec.objects:
-            flat.append(obj)
-            flat.extend(obj.children)
-        return flat
+        return flatten_objects(list(self.scene_spec.objects))
 
     @property
     def root(self) -> list[ObjectSpec]:
@@ -121,12 +144,34 @@ class SceneGraph:
             track.update(dt, self.scene_spec)
 
         self.last_contacts = self.physics.step(dt) if self.physics is not None else []
+        if self.last_contacts and "impact_shake" in self.camera.effects:
+            strength = min(8.0, 1.5 + 0.5 * len(self.last_contacts))
+            self.trigger_camera_shake(strength, 0.18, 24.0)
 
         for obj in self.objects:
             if obj.flipbook is not None:
                 obj.elapsed_ms += dt * 1000.0
 
         self._update_particles(dt)
+
+        update_camera_target(self.camera, self.objects, dt)
+        update_camera_shake(self.camera, dt, self.clock.elapsed)
+        if self._camera_transition is not None:
+            start, end, elapsed, duration, easing = self._camera_transition
+            elapsed = min(duration, elapsed + max(dt, 0.0))
+            self.camera = transition_camera(start, end, elapsed / max(duration, 1e-9), easing)
+            self._camera_transition = None if elapsed >= duration else (start, end, elapsed, duration, easing)
+
+    def trigger_camera_shake(self, intensity: float = 4.0, duration: float = 0.25,
+                             frequency: float = 18.0) -> None:
+        """Trigger a deterministic impact impulse on this graph's camera."""
+        trigger_camera_shake(self.camera, intensity, duration, frequency)
+
+    def transition_to_camera(self, target: CameraSpec, duration: float = 0.5,
+                             easing: str = "smoothstep") -> None:
+        """Schedule a deterministic cinematic transition to ``target``."""
+        self._camera_transition = (dataclasses.replace(self.camera), dataclasses.replace(target),
+                                   0.0, max(float(duration), 1e-9), easing)
 
         self.last_hud_events = self.hud.handle_input(input_state) if self.hud is not None else []
 
@@ -150,7 +195,7 @@ class SceneGraph:
     def render(self) -> np.ndarray:
         raster = RasterSpec(width=self.camera.viewport_width, height=self.camera.viewport_height, mode="rgba")
         renderer_objects, sprite_objects = _split_sprite_objects(self.scene_spec.objects)
-        base_scene = dataclasses.replace(self.scene_spec, objects=renderer_objects)
+        base_scene = _camera_scene(dataclasses.replace(self.scene_spec, objects=renderer_objects), self.camera)
 
         if self.layers.layers:
             layer_images = self.layers.render_layers(base_scene, self.camera, make_scene)
@@ -181,8 +226,68 @@ class SceneGraph:
 
         if self.hud is not None:
             self.hud.render(frame)
+        return apply_camera_effects(frame, self.camera.effects)
 
-        return frame
+    def snapshot(self) -> dict:
+        """Return a JSON-friendly deterministic checkpoint of the simulation."""
+        bodies = []
+        if self.physics is not None:
+            for obj, body in self.physics.entries():
+                bodies.append({"name": obj.name, "x": obj.x, "y": obj.y,
+                               "velocity": list(self.physics.velocity(obj)),
+                               "is_static": body.is_static})
+        tweens = []
+        for track in self.animations:
+            for tween in getattr(track, "tweens", ()):
+                tweens.append({"target": tween.target, "property": tween.property,
+                               "elapsed": tween.elapsed, "reversed": tween.reversed})
+        particles = []
+        for pool in self.particles:
+            particles.append({
+                "alive": pool.alive.astype(bool).tolist(),
+                "positions": pool.positions.tolist(), "velocities": pool.velocities.tolist(),
+                "ages": pool.ages.tolist(), "lifetimes": pool.lifetimes.tolist(),
+                "emit_carry": pool._emit_carry,
+            })
+        return {"scene": scene_to_dict(self.scene_spec), "bodies": bodies,
+                "tweens": tweens, "particles": particles,
+                "camera": {"viewport_width": self.camera.viewport_width, "viewport_height": self.camera.viewport_height,
+                            "world_x": self.camera.world_x, "world_y": self.camera.world_y,
+                            "zoom": self.camera.zoom, "rotation": self.camera.rotation},
+                "clock": {"elapsed": self.clock.elapsed,
+                "frame_count": self.clock.frame_count, "accumulator": self.clock.accumulator}}
+
+    def restore_snapshot(self, snapshot: dict) -> None:
+        """Restore mutable simulation state from :meth:`snapshot`."""
+        self.scene_spec = scene_from_dict(snapshot["scene"])
+        by_name = {obj.name: obj for obj in self.objects if obj.name}
+        for entry in snapshot.get("bodies", ()):
+            obj = by_name.get(entry.get("name"))
+            if obj is not None:
+                obj.x, obj.y = entry["x"], entry["y"]
+                if self.physics is not None and self.physics.has_body(obj):
+                    self.physics.set_velocity(obj, *entry["velocity"])
+        for entry, tween_state in zip(
+            (tween for track in self.animations for tween in getattr(track, "tweens", ())),
+            snapshot.get("tweens", ()),
+        ):
+            entry.elapsed = tween_state.get("elapsed", entry.elapsed)
+            entry._reversed = bool(tween_state.get("reversed", entry.reversed))
+        for pool, state in zip(self.particles, snapshot.get("particles", ())):
+            pool.alive[:] = np.asarray(state["alive"], dtype=bool)
+            pool.positions[:] = np.asarray(state["positions"], dtype=np.float32)
+            pool.velocities[:] = np.asarray(state["velocities"], dtype=np.float32)
+            pool.ages[:] = np.asarray(state["ages"], dtype=np.float32)
+            pool.lifetimes[:] = np.asarray(state["lifetimes"], dtype=np.float32)
+            pool._emit_carry = float(state.get("emit_carry", 0.0))
+        camera = snapshot.get("camera", {})
+        for key in ("viewport_width", "viewport_height", "world_x", "world_y", "zoom", "rotation"):
+            if key in camera:
+                setattr(self.camera, key, camera[key])
+        state = snapshot.get("clock", {})
+        self.clock.elapsed = state.get("elapsed", 0.0)
+        self.clock.frame_count = state.get("frame_count", 0)
+        self.clock.accumulator = state.get("accumulator", 0.0)
 
     def tick(self, real_dt: float, input_state: InputState) -> np.ndarray:
         """One complete frame: run all due fixed updates, then render once."""

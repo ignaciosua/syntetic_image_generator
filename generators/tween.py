@@ -74,6 +74,12 @@ class Tween:
     def finished(self) -> bool:
         return not self.loop and self.elapsed >= self.delay + self.duration
 
+    @property
+    def reversed(self) -> bool:
+        """Whether a ping-pong tween is currently traversing backwards."""
+
+        return self._reversed
+
     def value(self) -> float:
         t = 0.0
         if self.duration > 0:

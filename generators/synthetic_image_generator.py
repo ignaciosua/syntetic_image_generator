@@ -1,8 +1,9 @@
 """
 synthetic_image_generator.py — Deterministic progressive visual generator.
 
-Single responsibility: given an integer index, return a 32×32×3 float32 image.
-Zero disk. Zero network. 100% deterministic (same idx = same image, always).
+Single responsibility: given an integer index and native canvas dimensions,
+return a float32 RGB image. The historical default remains 32×32×3.
+Zero disk. Zero network. 100% deterministic for the same index and dimensions.
 
 154 levels of progressive visual complexity:
   1D → 2D → 3D → hollow → edges → palettes → textures →
@@ -26,6 +27,8 @@ import multiprocessing
 import threading
 import time
 from collections.abc import Iterable
+from contextlib import contextmanager
+from dataclasses import replace
 from functools import lru_cache
 from scipy.ndimage import gaussian_filter
 from scipy.fft import dctn, idctn
@@ -33,7 +36,12 @@ from scipy.ndimage import map_coordinates, binary_fill_holes
 
 # ── Constants ──
 PRIMO = 2654435761   # golden-ratio prime for hash seed
-H, W, C = 32, 32, 3  # output shape
+DEFAULT_HEIGHT, DEFAULT_WIDTH, C = 32, 32, 3
+MIN_NATIVE_DIMENSION = 32
+MAX_CANVAS_DIMENSION = 4096
+MAX_CANVAS_PIXELS = 8_388_608
+H, W = DEFAULT_HEIGHT, DEFAULT_WIDTH
+_SCALE_INDEXED_GEOMETRY = False
 # Level schedule is shared by all six generators so that idx → level is the same
 # everywhere; see levels.py for what it used to be and why that broke cross-modal
 # learning. This file's own weighted table is gone with it — uneven per-level budgets
@@ -55,11 +63,16 @@ if __package__:
     from .scene_spec import (
         Background,
         LightSpec,
+        LayoutRelation,
+        LayoutSpec,
+        MaterialSpec,
         ObjectSpec,
         PostSpec,
         RasterSpec,
         SceneSpec,
     )
+    from .materials import evaluate_material
+    from .layout import resolve_layout
     from .wave import (
         WAVE_LEVELS,
         theta as wave_theta,
@@ -85,11 +98,16 @@ else:
     from scene_spec import (
         Background,
         LightSpec,
+        LayoutRelation,
+        LayoutSpec,
+        MaterialSpec,
         ObjectSpec,
         PostSpec,
         RasterSpec,
         SceneSpec,
     )
+    from materials import evaluate_material
+    from layout import resolve_layout
     from wave import (
         WAVE_LEVELS,
         theta as wave_theta,
@@ -143,9 +161,12 @@ def _perlin(rng, octaves=3):
     n = np.zeros((H, W), np.float32)
     for o in range(octaves):
         s = 2 ** o
-        nh, nw = max(1, H // s), max(1, W // s)
+        # Ceil division covers odd and non-power-of-two canvas dimensions.
+        nh, nw = max(1, math.ceil(H / s)), max(1, math.ceil(W / s))
         b = rng.randn(nh, nw).astype(np.float32)
-        b = np.repeat(np.repeat(b, s, axis=0)[:H], s, axis=1)[:W]
+        b = np.repeat(
+            np.repeat(b, s, axis=0)[:H], s, axis=1
+        )[:, :W]
         n += b / (2 ** o)
     mn, mx = n.min(), n.max()
     return (n - mn) / (mx - mn + 1e-8)
@@ -171,6 +192,11 @@ def _edge_sobel(ch):
 
 def _bresenham(img, x0, y0, x1, y1, thick, color):
     h, w = img.shape[:2]
+    scale = _indexed_geometry_scales()[2]
+    if scale != 1.0:
+        thick = max(
+            0, int(round(((2 * int(thick) + 1) * scale - 1) * 0.5))
+        )
     dx, dy = abs(x1 - x0), abs(y1 - y0)
     sx = 1 if x0 < x1 else -1
     sy = 1 if y0 < y1 else -1
@@ -205,17 +231,29 @@ def _canvas_ogrid():
     return _cached_ogrid(H, W)
 
 
+def _indexed_geometry_scales():
+    if not _SCALE_INDEXED_GEOMETRY:
+        return 1.0, 1.0, 1.0
+    scale_x = W / DEFAULT_WIDTH
+    scale_y = H / DEFAULT_HEIGHT
+    return scale_x, scale_y, min(scale_x, scale_y)
+
+
 def _sphere(cx, cy, R):
+    R *= _indexed_geometry_scales()[2]
     yy, xx = _canvas_ogrid()
     dd = ((xx - cx) ** 2 + (yy - cy) ** 2) / R ** 2
     m = dd <= 1.0
     return m, np.where(m, (xx - cx) / R, 0), np.where(m, (yy - cy) / R, 0), np.where(m, np.sqrt(np.maximum(0, 1.0 - dd)), 0)
 
 def _ellipse(cx, cy, rx, ry):
+    scale_x, scale_y, _scale = _indexed_geometry_scales()
+    rx, ry = rx * scale_x, ry * scale_y
     yy, xx = _canvas_ogrid()
     return ((xx - cx) ** 2 / rx ** 2 + (yy - cy) ** 2 / ry ** 2) <= 1
 
 def _cylinder_side(cx, cy, R):
+    R *= _indexed_geometry_scales()[2]
     yy, xx = _canvas_ogrid()
     dd = ((xx - cx) ** 2 + (yy - cy) ** 2) / R ** 2
     m = dd <= 1.0
@@ -223,6 +261,8 @@ def _cylinder_side(cx, cy, R):
     return m, np.where(m, (xx - cx) / (rr + 1e-8), 0), np.where(m, (yy - cy) / (rr + 1e-8), 0)
 
 def _organic_blob(rng, cx, cy, rx, ry):
+    scale_x, scale_y, _scale = _indexed_geometry_scales()
+    rx, ry = rx * scale_x, ry * scale_y
     yy, xx = _canvas_ogrid()
     ang = np.arctan2(yy - cy, xx - cx)
     na = 24
@@ -236,6 +276,7 @@ def _organic_blob(rng, cx, cy, rx, ry):
     return m, np.where(m, (xx - cx) / (wrx + 1e-8), 0), np.where(m, (yy - cy) / (wry + 1e-8), 0), np.where(m, np.sqrt(np.maximum(0, 1.0 - d ** 2)), 0)
 
 def _splat(rng, cx, cy, R):
+    R *= _indexed_geometry_scales()[2]
     yy, xx = _canvas_ogrid()
     rx, ry = R, R * rng.uniform(0.5, 1.8)
     ang = rng.uniform(0, math.pi)
@@ -252,6 +293,8 @@ def _splat(rng, cx, cy, R):
     return m, np.where(m, -(xx - cx) / (R + 1e-8), 0), np.where(m, -(yy - cy) / (R + 1e-8), 0), np.where(m, np.sqrt(np.maximum(0, 1.0 - d)), 0)
 
 def _hollow_ellipse(cx, cy, rx, ry, th):
+    scale_x, scale_y, scale = _indexed_geometry_scales()
+    rx, ry, th = rx * scale_x, ry * scale_y, th * scale
     yy, xx = _canvas_ogrid()
     do = ((xx - cx) ** 2 / rx ** 2 + (yy - cy) ** 2 / ry ** 2)
     tirx, tiry = rx - th, ry - th
@@ -260,6 +303,8 @@ def _hollow_ellipse(cx, cy, rx, ry, th):
     return (do <= 1.0) & (((xx - cx) ** 2 / tirx ** 2 + (yy - cy) ** 2 / tiry ** 2) > 1.0)
 
 def _hollow_rect(x, y, ww, hh, th):
+    scale_x, scale_y, scale = _indexed_geometry_scales()
+    ww, hh, th = ww * scale_x, hh * scale_y, th * scale
     x0, x1 = max(0, int(x)), min(W, int(x + ww))
     y0, y1 = max(0, int(y)), min(H, int(y + hh))
     xi0, xi1 = int(x0 + th), int(x1 - th)
@@ -272,6 +317,8 @@ def _hollow_rect(x, y, ww, hh, th):
 
 def _hollow_blob(rng, cx, cy, rx, ry, th=None):
     """Organic outline of constant width in pixels (a proportional ring reads as a donut)."""
+    scale_x, scale_y, scale = _indexed_geometry_scales()
+    rx, ry = rx * scale_x, ry * scale_y
     yy, xx = _canvas_ogrid()
     ang = np.arctan2(yy - cy, xx - cx)
     na = 24
@@ -281,7 +328,7 @@ def _hollow_blob(rng, cx, cy, rx, ry, th=None):
     warp = np.interp(ang % (2 * math.pi), a, p, period=2 * math.pi).reshape(H, W)
     wrx, wry = rx * (1 + warp), ry * (1 + warp)
     d = np.sqrt(((xx - cx) ** 2 / wrx ** 2 + (yy - cy) ** 2 / wry ** 2))
-    th = rng.uniform(0.8, 2.4) if th is None else th
+    th = (rng.uniform(0.8, 2.4) if th is None else th) * scale
     frac = np.clip(1.0 - th / np.maximum(np.minimum(wrx, wry), 1e-3), 0.05, 0.95)
     return (d <= 1.0) & (d > frac)
 
@@ -445,11 +492,11 @@ def _draw_3d(img, mask, Nx, Ny, Nz, light, color):
     col = np.asarray(color, np.float32) * _SUBJECT_GAIN * _LIGHT_COL
     rim = (1.0 - np.abs(Nz)) ** 3 * _RIM if _RIM else None     # subsurface / backlit edge glow
     for cc in range(C):
-        v = col[cc] * lit
+        v = col[..., cc] * lit if col.ndim == 3 else col[cc] * lit
         if _IRID:                                              # thin-film interference
             v = v * (0.62 + 0.5 * np.sin(Nz * 5.5 + cc * 2.1 + _IRID))
         if rim is not None:
-            v = v + rim * col[cc]
+            v = v + rim * (col[..., cc] if col.ndim == 3 else col[cc])
         img[:, :, cc][mask] = np.clip(v[mask], 0, 1)
 
 def _fill(img, mask, color):
@@ -904,32 +951,56 @@ def _rect(x0, y0, x1, y1):
     m[max(0, int(y0)):max(0, int(y1)), max(0, int(x0)):max(0, int(x1))] = True
     return m
 
-def _render_at(res, idx, lvl, step=7):
-    """Render one level on a res×res canvas (temporary global swap).
+@contextmanager
+def _canvas_size(width, height):
+    """Temporarily select one native canvas while the render lock is held."""
+    global H, W
+    old_height, old_width = H, W
+    H, W = int(height), int(width)
+    try:
+        yield
+    finally:
+        H, W = old_height, old_width
+
+
+@contextmanager
+def _indexed_geometry_mode(enabled):
+    """Scale canonical primitive sizes only for non-default indexed renders."""
+    global _SCALE_INDEXED_GEOMETRY
+    previous = _SCALE_INDEXED_GEOMETRY
+    _SCALE_INDEXED_GEOMETRY = bool(enabled)
+    try:
+        yield
+    finally:
+        _SCALE_INDEXED_GEOMETRY = previous
+
+
+def _render_at(width, height, idx, lvl, step=7):
+    """Render one level on a width×height canvas (temporary global swap).
 
     Public render entry points hold ``_RENDER_LOCK`` while this legacy
     module-global H/W swap is active.
     """
-    global H, W
-    oh, ow = H, W
-    H = W = res
-    try:
+    with _canvas_size(width, height):
         return _render_image(idx, step, force_level=lvl)
-    finally:
-        H, W = oh, ow
 
-def _base_render(rng, res=None):
+def _base_render(rng, size=None):
     """A random content level, optionally rendered at higher resolution."""
-    pool = FRAME_POOL if res else RICH_POOL
+    pool = FRAME_POOL if size else RICH_POOL
     lvl = pool[rng.randint(0, len(pool))]
     idx = _level_start(lvl, rng) + rng.randint(0, SAMPLES_PER_LEVEL)
-    if res is None:
+    if size is None:
         return _render_image(idx, 7, force_level=lvl)
-    return _render_at(res, idx, lvl)
+    width, height = size
+    return _render_at(width, height, idx, lvl)
 
 def _box_down(img, f):
-    h, w = img.shape[0] // f, img.shape[1] // f
-    return img[:h * f, :w * f].reshape(h, f, w, f, C).mean(axis=(1, 3))
+    source_h, source_w = img.shape[:2]
+    h, w = math.ceil(source_h / f), math.ceil(source_w / f)
+    pad_h, pad_w = h * f - source_h, w * f - source_w
+    if pad_h or pad_w:
+        img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    return img.reshape(h, f, w, f, C).mean(axis=(1, 3))
 
 def _motion_blur(img, rng):
     ang = rng.uniform(0, math.pi)
@@ -989,13 +1060,17 @@ def _vignette(img, rng, strength=None):
 
 def _soft_disc(cx, cy, R):
     """Antialiased disc alpha — the only way to get sub-pixel edges at 32px."""
+    R *= _indexed_geometry_scales()[2]
     yy, xx = _canvas_ogrid()
     d = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
     return np.clip(R - d + 0.5, 0, 1).astype(np.float32)
 
 def _blend(img, alpha, color):
     a = alpha.reshape(H, W, 1)
-    return np.clip(img * (1 - a) + np.asarray(color).reshape(1, 1, C) * a, 0, 1)
+    color_array = np.asarray(color)
+    if color_array.ndim == 1:
+        return np.clip(img * (1 - a) + color_array.reshape(1, 1, C) * a, 0, 1)
+    return np.clip(img * (1 - a) + color_array * a, 0, 1)
 
 def _photo_color(rng, lo=0.05, hi=0.95):
     """A plausible photographic color: channels correlated around a luminance, rarely saturated."""
@@ -1061,6 +1136,12 @@ def _branch(img, rng, x, y, ang, length, thick, color, depth):
 
 def _tube(img, x0, y0, x1, y1, r, color, L, taper=1.0):
     """Shaded cylinder between two points — the 3D counterpart of a 2D stroke."""
+    scale_x, scale_y, scale = _indexed_geometry_scales()
+    if scale_x != 1.0 or scale_y != 1.0:
+        mx, my = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+        x0, x1 = mx + (x0 - mx) * scale_x, mx + (x1 - mx) * scale_x
+        y0, y1 = my + (y0 - my) * scale_y, my + (y1 - my) * scale_y
+        r *= scale
     yy, xx = _canvas_ogrid()
     dx, dy = x1 - x0, y1 - y0
     ln = math.sqrt(dx * dx + dy * dy) + 1e-8
@@ -1076,6 +1157,12 @@ def _tube(img, x0, y0, x1, y1, r, color, L, taper=1.0):
 
 def _fire_tube(img, x0, y0, x1, y1, r, color, taper=1.0):
     """Emissive tube — additive, no phong (fire IS the light source)."""
+    scale_x, scale_y, scale = _indexed_geometry_scales()
+    if scale_x != 1.0 or scale_y != 1.0:
+        mx, my = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+        x0, x1 = mx + (x0 - mx) * scale_x, mx + (x1 - mx) * scale_x
+        y0, y1 = my + (y0 - my) * scale_y, my + (y1 - my) * scale_y
+        r *= scale
     yy, xx = _canvas_ogrid()
     dx, dy = x1 - x0, y1 - y0
     ln = math.sqrt(dx * dx + dy * dy) + 1e-8
@@ -1123,10 +1210,12 @@ def _box3d(img, x0, y0, x1, y1, dx, dy, color, L, faces=True):
             lit = _phong(np.full((H, W), n[0], np.float32), np.full((H, W), n[1], np.float32),
                          np.full((H, W), n[2], np.float32), L)
             for ch in range(C):
-                img[:, :, ch][m] = np.clip(color[ch] * _LIGHT_COL[ch] * lit[m], 0, 1)
+                surface = color[..., ch][m] if np.asarray(color).ndim == 3 else color[ch]
+                img[:, :, ch][m] = np.clip(surface * _LIGHT_COL[ch] * lit[m], 0, 1)
     lit = _phong(np.zeros((H, W), np.float32), np.zeros((H, W), np.float32), np.ones((H, W), np.float32), L)
     for ch in range(C):
-        img[:, :, ch][front] = np.clip(color[ch] * _LIGHT_COL[ch] * lit[front], 0, 1)
+        surface = color[..., ch][front] if np.asarray(color).ndim == 3 else color[ch]
+        img[:, :, ch][front] = np.clip(surface * _LIGHT_COL[ch] * lit[front], 0, 1)
     return front, top, side
 
 def _ground(rng, img, hz, gcol=None, hi_key=False):
@@ -1339,6 +1428,8 @@ def _blackbody(T):
 
 def _point_source(img, x, y, flux, color, core=0.7, halo=3.0, spikes=False):
     """A point of light as an optical system really renders it: core + halo (+ diffraction spikes)."""
+    scale = _indexed_geometry_scales()[2]
+    core, halo = core * scale, halo * scale
     yy, xx = np.ogrid[:H, :W]
     d2 = (xx - x) ** 2 + (yy - y) ** 2
     psf = np.exp(-d2 / (2 * core ** 2)) + 0.18 * np.exp(-d2 / (2 * halo ** 2))
@@ -1356,36 +1447,44 @@ def _poisson(img, rng, photons=None):
 
 def _reaction_diffusion_initial(rng):
     """Prepare one deterministic Gray-Scott state without evolving it."""
-    S = 32                                  # periodic boundary: the pattern tiles, no crop needed
+    height, width = H, W                    # periodic boundary: no crop needed
     # only presets that actually develop within a few hundred steps (measured, dt must stay at 1.0)
     f, k = [(0.029, 0.057), (0.055, 0.062), (0.039, 0.058),
             (0.026, 0.051), (0.037, 0.060), (0.042, 0.059)][rng.randint(0, 6)]
-    U = np.ones((S, S), np.float32)
+    U = np.ones((height, width), np.float32)
     # seed from structured noise instead of a few dots: mature-looking patterns in far fewer steps
-    seed = np.repeat(np.repeat(rng.rand(S // 4 + 1, S // 4 + 1).astype(np.float32), 4, 0), 4, 1)[:S, :S]
+    seed = np.repeat(
+        np.repeat(
+            rng.rand(height // 4 + 1, width // 4 + 1).astype(np.float32),
+            4, axis=0,
+        ),
+        4, axis=1,
+    )[:height, :width]
     V = (seed > rng.uniform(0.55, 0.75)).astype(np.float32) * 0.25
     U -= V * 2
-    V += rng.rand(S, S).astype(np.float32) * 0.02
+    V += rng.rand(height, width).astype(np.float32) * 0.02
     steps = int(rng.randint(200, 340))
     return U, V, float(f), float(k), steps
 
 
 def _reaction_diffusion_evolve(U, V, f, k, steps):
     """Evolve a prepared state on CPU using the byte-exact legacy order."""
-    S = 32
+    height, width = U.shape
     Du, Dv, dt = 0.16, 0.08, 1.0            # dt>1 blows the pattern away, verified empirically
-    previous = np.r_[S - 1, np.arange(S - 1)]
-    following = np.r_[np.arange(1, S), 0]
+    previous_y = np.r_[height - 1, np.arange(height - 1)]
+    following_y = np.r_[np.arange(1, height), 0]
+    previous_x = np.r_[width - 1, np.arange(width - 1)]
+    following_x = np.r_[np.arange(1, width), 0]
     for _ in range(steps):
         # Direct periodic indexing preserves the legacy addition order while
         # avoiding four general-purpose ``np.roll`` calls per field and step.
         lu = (
-            U[previous, :] + U[following, :]
-            + U[:, previous] + U[:, following] - 4 * U
+            U[previous_y, :] + U[following_y, :]
+            + U[:, previous_x] + U[:, following_x] - 4 * U
         )
         lv = (
-            V[previous, :] + V[following, :]
-            + V[:, previous] + V[:, following] - 4 * V
+            V[previous_y, :] + V[following_y, :]
+            + V[:, previous_x] + V[:, following_x] - 4 * V
         )
         uvv = U * V * V
         U += dt * (Du * lu - uvv + f * (1 - U))
@@ -2592,14 +2691,14 @@ def _render_image(idx: int, step: int = 7, force_level: int | None = None) -> np
                 _critter_3d(rng2, img, rng2.uniform(0.2, 0.9, C), rng2.randint(0, 5))
 
     # ── 80-81: CAPTURE PIPELINE ──
-    elif lvl == 80:  # supersample + box downsample → antialiased edges like a real 32px photo
-        img = _box_down(_base_render(rng2, res=64), 2)
+    elif lvl == 80:  # supersample + box downsample → antialiased edges
+        img = _box_down(_base_render(rng2, size=(W * 2, H * 2)), 2)
         if rng2.randint(0, 2) == 0:
             img = _add_grain(img, rng2)
 
-    elif lvl == 81:  # random crop of a 2× render → off-center framing, objects cut by the border
-        big = _base_render(rng2, res=64)
-        y0, x0 = rng2.randint(0, 64 - H + 1), rng2.randint(0, 64 - W + 1)
+    elif lvl == 81:  # random crop of a 2× render → off-center framing
+        big = _base_render(rng2, size=(W * 2, H * 2))
+        y0, x0 = rng2.randint(0, H + 1), rng2.randint(0, W + 1)
         img = np.ascontiguousarray(big[y0:y0 + H, x0:x0 + W])
 
     # ── 82-84: VEHICLES (man-made, hard edges, wheels/wings/hulls) ──
@@ -4561,9 +4660,60 @@ def _validated_force_level(force_level):
     return force_level
 
 
-def _make_image_unlocked(idx, step, force_level, raster):
+def _validated_canvas_size(width=None, height=None, raster=None):
+    """Resolve and validate the native render size for one public call."""
+    explicit = width is not None or height is not None
+    if width is None and height is None:
+        if raster is not None:
+            raster_width, raster_height = int(raster.width), int(raster.height)
+            if (
+                raster_width >= MIN_NATIVE_DIMENSION
+                and raster_height >= MIN_NATIVE_DIMENSION
+            ):
+                width, height = raster_width, raster_height
+            else:
+                # Preserve the established tiny-raster contract: render the
+                # smallest supported native canvas and reduce during format
+                # conversion.
+                width, height = DEFAULT_WIDTH, DEFAULT_HEIGHT
+        else:
+            width, height = DEFAULT_WIDTH, DEFAULT_HEIGHT
+    elif width is None or height is None:
+        raise ValueError("width and height must be provided together")
+    for name, value in (("width", width), ("height", height)):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+        ):
+            raise TypeError(f"{name} must be an integer")
+        if not MIN_NATIVE_DIMENSION <= int(value) <= MAX_CANVAS_DIMENSION:
+            raise ValueError(
+                f"{name} must be between {MIN_NATIVE_DIMENSION} and "
+                f"{MAX_CANVAS_DIMENSION} for native rendering"
+            )
+    width, height = int(width), int(height)
+    if width * height > MAX_CANVAS_PIXELS:
+        raise ValueError(
+            f"width * height must not exceed {MAX_CANVAS_PIXELS} pixels"
+        )
+    if explicit and raster is not None and (
+        int(raster.width) != width or int(raster.height) != height
+    ):
+        raise ValueError(
+            "explicit width and height must match RasterSpec.width and height"
+        )
+    return width, height
+
+
+def _make_image_unlocked(idx, step, force_level, raster, width, height):
     """Render one already-validated index while the caller owns the state lock."""
-    image = _apply_scene(_render_image(idx, step, force_level), _scene(idx))
+    with _canvas_size(width, height):
+        with _indexed_geometry_mode(
+            width != DEFAULT_WIDTH or height != DEFAULT_HEIGHT
+        ):
+            image = _apply_scene(
+                _render_image(idx, step, force_level), _scene(idx)
+            )
     if raster is None:
         return image
     source = (
@@ -4579,6 +4729,9 @@ def make_image(
     step: int = 7,
     force_level: int | None = None,
     raster: RasterSpec | None = None,
+    *,
+    width: int | None = None,
+    height: int | None = None,
 ) -> np.ndarray:
     """Generate a deterministic image from one non-negative integer index.
 
@@ -4586,10 +4739,13 @@ def make_image(
         idx:  Integer seed — same idx always returns the same image.
         step: Positive skip between consecutive hash-indices (default 7).
         force_level: If set, use this level instead of deriving from idx.
-        raster: Optional output resolution, color mode, and bit depth.
+        raster: Optional native resolution, color mode, and bit depth.
+        width: Native canvas width. Must be supplied together with ``height``.
+        height: Native canvas height. Must be supplied together with ``width``.
 
     Returns:
         By default, a float32 array of shape (32, 32, 3) in [0, 1].
+        With ``width`` and ``height``, a native ``(height, width, 3)`` render.
         When ``raster`` is provided, an array matching that specification.
 
     The scene attributes go on here, outside _render_image, because the level code
@@ -4601,8 +4757,11 @@ def make_image(
     force_level = _validated_force_level(force_level)
     if raster is not None:
         _validated_raster_spec(raster)
+    width, height = _validated_canvas_size(width, height, raster)
     with _RENDER_LOCK:
-        return _make_image_unlocked(idx, step, force_level, raster)
+        return _make_image_unlocked(
+            idx, step, force_level, raster, width, height
+        )
 
 
 BATCH_BACKENDS: tuple[str, ...] = ("auto", "serial", "process", "webgpu")
@@ -4638,8 +4797,15 @@ _CPU_WORKER_WARMED = False
 
 def _make_image_task(arguments):
     """Picklable worker entry point used by the process backend."""
-    idx, step, force_level, raster = arguments
-    return make_image(idx, step=step, force_level=force_level, raster=raster)
+    if len(arguments) == 4:
+        idx, step, force_level, raster = arguments
+        width = height = None
+    else:
+        idx, step, force_level, raster, width, height = arguments
+    return make_image(
+        idx, step=step, force_level=force_level, raster=raster,
+        width=width, height=height,
+    )
 
 
 def _worker_pid(_value):
@@ -5131,9 +5297,9 @@ def _auto_cpu_executor(
         return executor
 
 
-def _empty_batch(raster):
+def _empty_batch(raster, width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT):
     if raster is None:
-        return np.empty((0, H, W, C), np.float32)
+        return np.empty((0, int(height), int(width), C), np.float32)
     mode, bits, _resize, _dither, packed = _validated_raster_spec(raster)
     height, width = int(raster.height), int(raster.width)
     if mode == "binary":
@@ -6563,6 +6729,8 @@ def make_images(
     step: int = 7,
     force_level: int | None = None,
     raster: RasterSpec | None = None,
+    width: int | None = None,
+    height: int | None = None,
     backend: str = "auto",
     workers: int | None = None,
     chunksize: int | None = None,
@@ -6570,6 +6738,10 @@ def make_images(
     fidelity: str = "legacy",
 ) -> np.ndarray:
     """Generate a deterministic batch using CPU or portable WebGPU.
+
+    ``width`` and ``height`` select one native canvas shared by the batch.
+    RasterSpec dimensions select the canvas when both axes meet the native
+    minimum; smaller legacy raster outputs are safely reduced from 32×32.
 
     ``backend="auto"`` keeps small batches serial. With ``workers=None`` and a
     sufficiently large batch it measures physical/SMT process counts, native
@@ -6594,6 +6766,12 @@ def make_images(
     force_level = _validated_force_level(force_level)
     if raster is not None:
         _validated_raster_spec(raster)
+    canvas_width, canvas_height = _validated_canvas_size(
+        width, height, raster
+    )
+    nondefault_canvas = (
+        canvas_width != DEFAULT_WIDTH or canvas_height != DEFAULT_HEIGHT
+    )
     if not isinstance(backend, str) or backend.lower() not in BATCH_BACKENDS:
         choices = ", ".join(BATCH_BACKENDS)
         raise ValueError(f"backend must be one of: {choices}")
@@ -6610,6 +6788,10 @@ def make_images(
             "backend='webgpu' requires fidelity='portable' because GPU "
             "transcendentals are not byte-identical across devices"
         )
+    if nondefault_canvas and backend == "webgpu":
+        # Portable kernels currently encode the 32×32 legacy contract. Native
+        # arbitrary-resolution batches remain exact by using the CPU renderer.
+        backend = "serial"
     supported_start_methods = set(multiprocessing.get_all_start_methods())
     if (
         not isinstance(start_method, str)
@@ -6638,7 +6820,7 @@ def make_images(
             raise ValueError("workers must be a positive integer or None")
         workers = int(workers)
     if not batch_indices:
-        return _empty_batch(raster)
+        return _empty_batch(raster, canvas_width, canvas_height)
 
     in_daemon = multiprocessing.current_process().daemon
     batch_levels = [
@@ -6701,6 +6883,7 @@ def make_images(
         if (
             fidelity == "portable"
             and raster is None
+            and not nondefault_canvas
             and family_positions
         ):
             if (
@@ -6798,7 +6981,8 @@ def make_images(
     if backend == "serial" or selected_workers == 1:
         images = (
             make_image(
-                idx, step=step, force_level=force_level, raster=raster
+                idx, step=step, force_level=force_level, raster=raster,
+                width=width, height=height,
             )
             for idx in batch_indices
         )
@@ -6807,7 +6991,10 @@ def make_images(
         images = auto_shared_executor.map(
             _make_image_task,
             (
-                (idx, step, force_level, raster)
+                (
+                    idx, step, force_level, raster,
+                    width, height,
+                )
                 for idx in batch_indices
             ),
             chunksize=chunksize,
@@ -6817,7 +7004,11 @@ def make_images(
         from concurrent.futures import ProcessPoolExecutor
 
         tasks = (
-            (idx, step, force_level, raster) for idx in batch_indices
+            (
+                idx, step, force_level, raster,
+                width, height,
+            )
+            for idx in batch_indices
         )
         # Fork is substantially cheaper for this SciPy-heavy package, but only
         # use it from a single-threaded Linux parent. Otherwise spawn avoids
@@ -7056,6 +7247,15 @@ def _validated_raster_spec(spec: RasterSpec):
         or spec.height <= 0
     ):
         raise ValueError("RasterSpec.width and height must be positive integers")
+    if (
+        int(spec.width) > MAX_CANVAS_DIMENSION
+        or int(spec.height) > MAX_CANVAS_DIMENSION
+        or int(spec.width) * int(spec.height) > MAX_CANVAS_PIXELS
+    ):
+        raise ValueError(
+            f"RasterSpec dimensions must not exceed {MAX_CANVAS_DIMENSION} "
+            f"per axis or {MAX_CANVAS_PIXELS} total pixels"
+        )
     if not isinstance(spec.mode, str) or spec.mode.lower() not in _RASTER_MODE_ALIASES:
         choices = ", ".join(sorted(_RASTER_MODE_ALIASES))
         raise ValueError(f"unsupported raster mode {spec.mode!r}; expected one of: {choices}")
@@ -7474,6 +7674,27 @@ def _scene_color(color, rng, lo=0.08, hi=0.95):
     return np.clip(value, 0.0, 1.0)
 
 
+def _scene_material(obj, color):
+    """Evaluate an optional procedural material for one scene object."""
+    if obj.material is None:
+        return color
+    extent = max(
+        float(obj.radius) * 2.0,
+        float(obj.width or 0.0),
+        float(obj.height or 0.0),
+        float(obj.size),
+        1.0,
+    )
+    return evaluate_material(
+        obj.material,
+        color,
+        H,
+        W,
+        (obj.resolved_x, obj.resolved_y),
+        extent,
+    )
+
+
 def _render_background(img: np.ndarray, bg: Background, rng: np.random.RandomState):
     """Render ``bg`` onto ``img`` in place."""
     if not isinstance(bg, Background):
@@ -7675,12 +7896,13 @@ def _render_object(img: np.ndarray, obj: ObjectSpec, light, rng: np.random.Rando
     if not 0.0 <= obj.opacity <= 1.0:
         raise ValueError("ObjectSpec.opacity must be between 0 and 1")
     color = _scene_color(obj.color, rng)
+    material_color = _scene_material(obj, color)
     coverage = np.zeros((H, W), np.float32)
     before = img.copy() if obj.opacity < 1.0 else None
 
     if kind == "sphere_3d":
         mask, nx, ny, nz = _sphere(x, y, max(0.1, float(obj.radius)))
-        _draw_3d(img, mask, nx, ny, nz, light, color)
+        _draw_3d(img, mask, nx, ny, nz, light, material_color)
         coverage = mask.astype(np.float32)
     elif kind == "blob_3d":
         radius = max(0.1, float(obj.radius))
@@ -7694,7 +7916,7 @@ def _render_object(img: np.ndarray, obj: ObjectSpec, light, rng: np.random.Rando
             mask, nx, ny, nz = _splat(rng, x, y, radius)
         else:
             raise ValueError("ObjectSpec.shape_type must be 0, 1, or 2")
-        _draw_3d(img, mask, nx, ny, nz, light, color)
+        _draw_3d(img, mask, nx, ny, nz, light, material_color)
         coverage = mask.astype(np.float32)
     elif kind == "tube":
         length = max(0.2, obj.width if obj.width is not None else obj.size)
@@ -7707,7 +7929,7 @@ def _render_object(img: np.ndarray, obj: ObjectSpec, light, rng: np.random.Rando
         )
         coverage = _tube(
             img, x - dx, y - dy, x + dx, y + dy,
-            max(0.1, obj.radius), color, light,
+            max(0.1, obj.radius), material_color, light,
         ).astype(np.float32)
     elif kind in {"box_3d", "building_3d", "car_3d"}:
         width = max(0.2, obj.width if obj.width is not None else obj.size)
@@ -7723,7 +7945,7 @@ def _render_object(img: np.ndarray, obj: ObjectSpec, light, rng: np.random.Rando
         dx, dy = math.cos(angle) * projection, -abs(math.sin(angle) * projection)
         faces = _box3d(
             img, x - width * 0.5, top, x + width * 0.5, bottom,
-            dx, dy, color, light,
+            dx, dy, material_color, light,
         )
         for face in faces:
             coverage = _coverage_over(coverage, face.astype(np.float32))
@@ -7768,7 +7990,7 @@ def _render_object(img: np.ndarray, obj: ObjectSpec, light, rng: np.random.Rando
     elif kind in {"disc", "disc_with_rim"}:
         radius = max(0.1, float(obj.radius))
         disc = _soft_disc(x, y, radius)
-        img[:] = _blend(img, disc, color)
+        img[:] = _blend(img, disc, material_color)
         coverage = disc
         if kind == "disc_with_rim":
             rim = np.clip(
@@ -7776,7 +7998,7 @@ def _render_object(img: np.ndarray, obj: ObjectSpec, light, rng: np.random.Rando
                 - _soft_disc(x, y, max(0.1, radius - max(0.8, radius * 0.16))),
                 0, 1,
             )
-            img[:] = _blend(img, rim, np.clip(color * 0.45, 0, 1))
+            img[:] = _blend(img, rim, np.clip(material_color * 0.45, 0, 1))
     elif kind == "particle_field":
         coverage = _render_particle_field(img, obj, color, rng)
     elif kind in _SCENE_MACRO_KINDS:
@@ -7886,6 +8108,17 @@ def _validate_scene_spec(spec):
         raise TypeError("SceneSpec.light must be a LightSpec")
     if not isinstance(spec.post, PostSpec):
         raise TypeError("SceneSpec.post must be a PostSpec")
+    if spec.layout is not None:
+        if not isinstance(spec.layout, LayoutSpec):
+            raise TypeError("SceneSpec.layout must be a LayoutSpec or None")
+        allowed_relations = {"left_of", "right_of", "above", "below", "behind", "in_front_of"}
+        for relation in spec.layout.relations:
+            if not isinstance(relation, LayoutRelation):
+                raise TypeError("LayoutSpec.relations must contain LayoutRelation instances")
+            if relation.relation.lower() not in allowed_relations:
+                raise ValueError(f"unsupported layout relation {relation.relation!r}")
+            if not np.isfinite(relation.gap):
+                raise ValueError("LayoutRelation.gap must be finite")
     if spec.post.style is not None and not isinstance(spec.post.style, str):
         raise TypeError("PostSpec.style must be a string or None")
     if not isinstance(spec.objects, (list, tuple)):
@@ -7894,7 +8127,48 @@ def _validate_scene_spec(spec):
         _validate_scene_object(obj, set())
 
 
-def _make_scene_unlocked(
+def _scale_scene_object(obj, scale_x, scale_y):
+    """Scale one canonical 32×32 object tree to the active native canvas."""
+    scale = min(scale_x, scale_y)
+    return replace(
+        obj,
+        x=float(obj.x) * scale_x,
+        y=float(obj.y) * scale_y,
+        radius=float(obj.radius) * scale,
+        width=None if obj.width is None else float(obj.width) * scale_x,
+        height=None if obj.height is None else float(obj.height) * scale_y,
+        depth_3d=(
+            None if obj.depth_3d is None else float(obj.depth_3d) * scale
+        ),
+        size=float(obj.size) * scale,
+        cx=None if obj.cx is None else float(obj.cx) * scale_x,
+        cy=None if obj.cy is None else float(obj.cy) * scale_y,
+        ground_y=(
+            None if obj.ground_y is None else float(obj.ground_y) * scale_y
+        ),
+        children=[
+            _scale_scene_object(child, scale_x, scale_y)
+            for child in obj.children
+        ],
+    )
+
+
+def _scale_scene_spec(spec, width, height):
+    """Return a non-mutating native-resolution view of a canonical scene."""
+    if width == DEFAULT_WIDTH and height == DEFAULT_HEIGHT:
+        return spec
+    scale_x = width / DEFAULT_WIDTH
+    scale_y = height / DEFAULT_HEIGHT
+    return replace(
+        spec,
+        objects=[
+            _scale_scene_object(obj, scale_x, scale_y)
+            for obj in spec.objects
+        ],
+    )
+
+
+def _render_scene_current_canvas(
     spec: SceneSpec,
     seed: int = 0,
     raster: RasterSpec | None = None,
@@ -7934,7 +8208,9 @@ def _make_scene_unlocked(
         light = light / norm
 
     global _RIM, _IRID, _SUBJECT_GAIN, _LIGHT_COL
-    previous_render_state = (_RIM, _IRID, _SUBJECT_GAIN, _LIGHT_COL)
+    # Copy the tint array: render helpers must not leak mutable global state
+    # between a high-resolution camera render and the legacy indexed contract.
+    previous_render_state = (_RIM, _IRID, _SUBJECT_GAIN, np.array(_LIGHT_COL, copy=True))
     _RIM, _IRID, _SUBJECT_GAIN = 0.0, 0.0, 1.0
     _LIGHT_COL = np.ones(C, np.float32)
     try:
@@ -7957,24 +8233,39 @@ def _make_scene_unlocked(
     return image if raster is None else convert_raster(image, raster)
 
 
+def _make_scene_unlocked(spec, seed, raster, width, height):
+    """Render a validated scene while the caller owns the render-state lock."""
+    with _canvas_size(width, height):
+        native_spec = _scale_scene_spec(spec, width, height)
+        return _render_scene_current_canvas(native_spec, seed, raster)
+
+
 def make_scene(
     spec: SceneSpec,
     seed: int = 0,
     raster: RasterSpec | None = None,
+    *,
+    width: int | None = None,
+    height: int | None = None,
 ) -> np.ndarray:
     """Render one deterministic structured scene.
 
     Objects are painted from far to near according to ``depth``. Randomized
-    defaults are local to ``seed``. Without ``raster`` the output is a
-    32×32×3 float32 RGB array; otherwise it follows the supplied RasterSpec.
+    defaults are local to ``seed``. Without dimensions the output is a
+    32×32×3 float32 RGB array. ``width`` and ``height`` select a native canvas;
+    otherwise a RasterSpec of at least 32 pixels per axis selects it.
     Public calls are safe across concurrent threads.
     """
     _validate_scene_spec(spec)
+    spec = resolve_layout(spec)
     seed = _validated_scene_seed(seed)
     if raster is not None:
         _validated_raster_spec(raster)
+    width, height = _validated_canvas_size(width, height, raster)
     with _RENDER_LOCK:
-        return _make_scene_unlocked(spec, seed=seed, raster=raster)
+        return _make_scene_unlocked(
+            spec, seed=seed, raster=raster, width=width, height=height
+        )
 
 
 def make_scene_raster(
