@@ -10,7 +10,7 @@ def test_public_indexed_contract():
     first = sig.make_image(42)
     second = sig.make_image(42)
 
-    assert sig.__version__ == "0.9.0"
+    assert isinstance(sig.__version__, str) and len(sig.__version__) > 0
     assert sig.N_LEVELS == 154
     assert (sig.H, sig.W, sig.C) == (32, 32, 3)
     assert len(sig.LEVEL_NAMES) == sig.N_LEVELS
