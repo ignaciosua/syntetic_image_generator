@@ -51,7 +51,7 @@ from .ui import HUD, WidgetSpec
 from .tween import AnimationTrack, Keyframe, KeyframeTrack, Tween
 from .tilemap import TilemapRenderer, TilemapSpec
 from .replay import FrameRecord, SessionPlayer, SessionRecorder, serialize_objects
-from .web_export import export_html
+from .web_export import export_html, export_live_html
 from .scene_levels import (
     SCENE_CATALOG_CONTRACT_VERSION,
     SCENE_CATALOG_CYCLE_SIZE,
@@ -168,6 +168,7 @@ __all__ = [
     "cpu_info",
     "convert_raster",
     "export_html",
+    "export_live_html",
     "extract_alpha",
     "find_collisions",
     "flipbook_region",

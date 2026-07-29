@@ -24,6 +24,47 @@ from .scene_graph import check_collision, object_aabb
 from .scene_spec import BoundingBox, CollisionShape, ObjectSpec
 
 
+def _exact_half_extents(obj: ObjectSpec) -> tuple[float, float]:
+    """The object's *own* collision half-width/half-height — radius for a
+    circle, width/height for a box. Unlike ``object_aabb`` (a deliberately
+    generous, query-oriented box that floors on ``radius``/``size``
+    defaults — see its docstring), this never lets an unset ``size``
+    (default 8.0) or ``radius`` (default 5.0) inflate a shape that never
+    asked for one; penetration math needs the real geometry, not padding.
+    """
+
+    if obj.collision_shape is CollisionShape.CIRCLE:
+        return obj.radius, obj.radius
+    return 0.5 * (obj.width if obj.width is not None else obj.size), 0.5 * (obj.height if obj.height is not None else obj.size)
+
+
+def _contact_normal_and_penetration(
+    obj_a: ObjectSpec, obj_b: ObjectSpec, dx: float, dy: float
+) -> tuple[float, float, float]:
+    """Contact normal (pointing a -> b) and penetration depth, using each
+    object's exact shape rather than a padded generic bounding box.
+
+    Center-to-center direction is only a valid normal for circle-circle
+    pairs. Any pair involving a box needs the axis of minimum penetration
+    (standard SAT-style separation) instead — using center-to-center there
+    lets a wide/thin box (e.g. flat ground under an off-center ball) yield
+    a mostly-sideways normal, which was launching bodies horizontally on
+    deep/fast penetration instead of pushing them back out vertically.
+    """
+
+    if obj_a.collision_shape is CollisionShape.CIRCLE and obj_b.collision_shape is CollisionShape.CIRCLE:
+        dist = math.hypot(dx, dy) or 1e-6
+        return dx / dist, dy / dist, max(0.0, obj_a.radius + obj_b.radius - dist)
+
+    half_wa, half_ha = _exact_half_extents(obj_a)
+    half_wb, half_hb = _exact_half_extents(obj_b)
+    overlap_x = (half_wa + half_wb) - abs(dx)
+    overlap_y = (half_ha + half_hb) - abs(dy)
+    if overlap_x < overlap_y:
+        return (1.0 if dx >= 0 else -1.0), 0.0, max(0.0, overlap_x)
+    return 0.0, (1.0 if dy >= 0 else -1.0), max(0.0, overlap_y)
+
+
 @dataclass
 class RigidBodySpec:
     mass: float = 1.0
@@ -74,6 +115,9 @@ class PhysicsWorld:
     def has_body(self, obj: ObjectSpec) -> bool:
         return any(o is obj for o, _ in self._entries)
 
+    def entries(self) -> list[tuple[ObjectSpec, RigidBodySpec]]:
+        return list(self._entries)
+
     def add_body(self, obj: ObjectSpec, body: RigidBodySpec) -> None:
         obj.x, obj.y = obj.resolved_x, obj.resolved_y
         obj.cx = obj.cy = obj.ground_y = None
@@ -82,6 +126,14 @@ class PhysicsWorld:
 
     def remove_body(self, body: RigidBodySpec) -> None:
         self._entries = [(o, b) for o, b in self._entries if b is not body]
+
+    def set_velocity(self, obj: ObjectSpec, vx: float, vy: float) -> None:
+        """Drive ``obj`` by intent (a desired velocity) instead of
+        setting its position directly — lets a controller (chase/flee)
+        express "move this way" while ``step()``'s collision resolution
+        still gets the final say (e.g. a wall blocking it)."""
+
+        self._velocities[id(obj)] = [vx, vy]
 
     def add_handler(self, handler: ContactHandler) -> None:
         self._handlers.append(handler)
@@ -119,13 +171,7 @@ class PhysicsWorld:
 
                 dx = obj_b.resolved_x - obj_a.resolved_x
                 dy = obj_b.resolved_y - obj_a.resolved_y
-                dist = math.hypot(dx, dy) or 1e-6
-                nx, ny = dx / dist, dy / dist
-
-                box_a, box_b = object_aabb(obj_a), object_aabb(obj_b)
-                overlap_x = min(box_a.x1, box_b.x1) - max(box_a.x0, box_b.x0)
-                overlap_y = min(box_a.y1, box_b.y1) - max(box_a.y0, box_b.y0)
-                penetration = max(0.0, min(overlap_x, overlap_y))
+                nx, ny, penetration = _contact_normal_and_penetration(obj_a, obj_b, dx, dy)
 
                 self._separate(obj_a, body_a, obj_b, body_b, nx, ny, penetration)
                 self._apply_impulse(obj_a, body_a, obj_b, body_b, nx, ny)
