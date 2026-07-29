@@ -1,9 +1,12 @@
 """Lightweight game-physics: semi-implicit Euler integration, AABB/circle
 collision resolution, raycasts. Not a conservation-grade simulator.
 
-Mutates the ``x``/``y`` fields of the ``ObjectSpec`` each body is attached
-to directly (not ``cx``/``cy``/``ground_y``) — bodies are expected to use the
-canonical coordinate fields.
+Simulation reads/writes an ``ObjectSpec``'s canonical ``x``/``y`` fields, not
+the ``cx``/``cy``/``ground_y`` aliases (whichever is set wins in
+``resolved_x``/``resolved_y``, but physics never touches those). To avoid
+silently simulating a body whose position never visibly moves,
+``add_body`` snapshots ``resolved_x``/``resolved_y`` into ``x``/``y`` and
+clears the aliases once, up front.
 """
 
 from __future__ import annotations
@@ -64,6 +67,8 @@ class PhysicsWorld:
         return [body for _, body in self._entries]
 
     def add_body(self, obj: ObjectSpec, body: RigidBodySpec) -> None:
+        obj.x, obj.y = obj.resolved_x, obj.resolved_y
+        obj.cx = obj.cy = obj.ground_y = None
         self._entries.append((obj, body))
         self._velocities[id(obj)] = list(body.velocity)
 
@@ -219,6 +224,15 @@ if __name__ == "__main__":
     world.add_body(falling, RigidBodySpec(mass=1.0))
     world.step(1.0)
     assert falling.y < 100  # gravity pulled it down
+
+    # cx/cy-built objects get normalized into x/y on add_body, or physics would
+    # silently move a field resolved_x/y never reads.
+    aliased = ObjectSpec(kind="sphere_3d", cx=0, cy=100, radius=1, collision_shape=CollisionShape.NONE)
+    alias_world = PhysicsWorld(gravity=(0, -100))
+    alias_world.add_body(aliased, RigidBodySpec(mass=1.0))
+    assert aliased.cx is None and aliased.x == 0.0
+    alias_world.step(1.0)
+    assert aliased.resolved_y < 100
 
     ground = ObjectSpec(kind="box_3d", x=0, y=0, size=20, collision_shape=CollisionShape.AABB)
     ball = ObjectSpec(kind="sphere_3d", x=0, y=5, radius=2, collision_shape=CollisionShape.CIRCLE)
