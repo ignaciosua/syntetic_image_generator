@@ -7,10 +7,41 @@ drawing helpers without making them public API.
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass, field
+
+import numpy as np
 
 
 Color = tuple[float, float, float]
+
+
+class CollisionShape(enum.Enum):
+    """Shape used by :mod:`generators.scene_graph` collision checks."""
+
+    NONE = "none"
+    AABB = "aabb"
+    CIRCLE = "circle"
+    CAPSULE = "capsule"
+
+
+@dataclass(frozen=True)
+class BoundingBox:
+    """Axis-aligned box in scene coordinates."""
+
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    def overlaps(self, other: "BoundingBox") -> bool:
+        return self.x0 < other.x1 and other.x0 < self.x1 and self.y0 < other.y1 and other.y0 < self.y1
+
+    def contains(self, px: float, py: float) -> bool:
+        return self.x0 <= px <= self.x1 and self.y0 <= py <= self.y1
+
+    def area(self) -> float:
+        return max(0.0, self.x1 - self.x0) * max(0.0, self.y1 - self.y0)
 
 
 @dataclass(frozen=True)
@@ -56,6 +87,43 @@ class Background:
     hi_key: bool = False
 
 
+@dataclass(frozen=True)
+class AtlasRegion:
+    """One named rectangle within an :class:`AtlasSpec` texture."""
+
+    name: str
+    x: int
+    y: int
+    width: int
+    height: int
+    pivot_x: float = 0.5
+    pivot_y: float = 0.5
+
+
+@dataclass(frozen=True)
+class AtlasSpec:
+    """A texture atlas: one image plus named sub-regions."""
+
+    image: np.ndarray
+    regions: tuple[AtlasRegion, ...]
+    default_region: str = ""
+
+    def get(self, name: str) -> AtlasRegion:
+        for region in self.regions:
+            if region.name == name:
+                return region
+        raise KeyError(f"no atlas region named {name!r}")
+
+
+@dataclass(frozen=True)
+class FlipbookClip:
+    """An ordered sequence of atlas regions played back as an animation."""
+
+    frames: tuple[AtlasRegion, ...]
+    frame_duration_ms: int
+    loop: bool = True
+
+
 @dataclass
 class ObjectSpec:
     """One independently positioned scene object.
@@ -84,6 +152,18 @@ class ObjectSpec:
     cx: float | None = None
     cy: float | None = None
     ground_y: float | None = None
+    tags: set[str] = field(default_factory=set)
+    layer: int = 0
+    visible: bool = True
+    name: str | None = None
+    collision_shape: CollisionShape = CollisionShape.NONE
+    sprite: AtlasRegion | None = None
+    texture_scale: float = 1.0
+    flip_x: bool = False
+    flip_y: bool = False
+    flipbook: FlipbookClip | None = None
+    frame: int = 0
+    elapsed_ms: float = 0.0
 
     @property
     def resolved_x(self) -> float:
@@ -107,6 +187,16 @@ class PostSpec:
 
 
 @dataclass
+class Layer:
+    """A named render layer. ``order`` matches ``ObjectSpec.layer``."""
+
+    name: str
+    order: int = 0
+    parallax: float = 1.0
+    visible: bool = True
+
+
+@dataclass
 class SceneSpec:
     """A complete composable scene."""
 
@@ -114,6 +204,7 @@ class SceneSpec:
     objects: list[ObjectSpec] = field(default_factory=list)
     light: LightSpec = field(default_factory=LightSpec)
     post: PostSpec = field(default_factory=PostSpec)
+    layers: dict[str, Layer] = field(default_factory=dict)
 
 
 if __name__ == "__main__":
@@ -126,4 +217,17 @@ if __name__ == "__main__":
     )
     assert aliased.objects[0].resolved_x == 10
     assert aliased.objects[0].resolved_y == 20
+
+    default_obj = ObjectSpec(kind="tree")
+    assert default_obj.tags == set() and default_obj.layer == 0
+    assert default_obj.visible is True and default_obj.name is None
+    assert default_obj.collision_shape is CollisionShape.NONE
+
+    a = BoundingBox(0, 0, 10, 10)
+    b = BoundingBox(5, 5, 15, 15)
+    c = BoundingBox(20, 20, 30, 30)
+    assert a.overlaps(b) and not a.overlaps(c)
+    assert a.contains(5, 5) and not a.contains(11, 5)
+    assert a.area() == 100.0
+
     print("OK — scene_spec importable and valid")

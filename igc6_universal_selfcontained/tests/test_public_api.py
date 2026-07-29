@@ -81,15 +81,20 @@ def test_public_raster_modes_and_bit_depths():
 def test_public_exports_are_declared():
     expected = {
         "Background",
+        "BoundingBox",
+        "CollisionShape",
         "LightSpec",
         "ObjectSpec",
         "PostSpec",
         "RasterSpec",
+        "SceneQuery",
         "SceneSpec",
+        "check_collision",
         "convert_raster",
         "cpu_info",
         "accelerator_info",
         "extract_alpha",
+        "find_collisions",
         "level_block",
         "level_of",
         "level_start",
@@ -98,6 +103,47 @@ def test_public_exports_are_declared():
         "make_image_raster",
         "make_scene",
         "make_scene_raster",
+        "object_aabb",
+        # scene-graph/mini-engine phases 2-13
+        "CameraSpec",
+        "world_to_screen",
+        "screen_to_world",
+        "aabb_in_view",
+        "Layer",
+        "LayerManager",
+        "AtlasRegion",
+        "AtlasSpec",
+        "FlipbookClip",
+        "stamp_sprite",
+        "flipbook_region",
+        "ParticleEmitterSpec",
+        "ParticlePool",
+        "RigidBodySpec",
+        "PhysicsWorld",
+        "Contact",
+        "ContactHandler",
+        "RayCastHit",
+        "InputState",
+        "InputProvider",
+        "NullInputProvider",
+        "ReplayInputProvider",
+        "WebInputProvider",
+        "PygameInputProvider",
+        "GameClock",
+        "SceneGraph",
+        "WidgetSpec",
+        "HUD",
+        "Tween",
+        "AnimationTrack",
+        "Keyframe",
+        "KeyframeTrack",
+        "TilemapSpec",
+        "TilemapRenderer",
+        "FrameRecord",
+        "SessionRecorder",
+        "SessionPlayer",
+        "serialize_objects",
+        "export_html",
     }
 
     assert expected <= set(sig.__all__)
@@ -802,3 +848,268 @@ def test_scene_validation_rejects_bad_seeds_and_cycles():
     parent.children.append(parent)
     with pytest.raises(ValueError, match="reference cycle"):
         sig.make_scene(sig.SceneSpec(objects=[parent]))
+
+
+def test_bounding_box_math():
+    a = sig.BoundingBox(0, 0, 10, 10)
+    b = sig.BoundingBox(5, 5, 15, 15)
+    c = sig.BoundingBox(20, 20, 30, 30)
+
+    assert a.overlaps(b) and b.overlaps(a)
+    assert not a.overlaps(c)
+    assert a.contains(5, 5)
+    assert not a.contains(11, 5)
+    assert a.area() == 100.0
+
+
+def test_object_metadata_is_inert_for_rendering():
+    def make(with_metadata: bool):
+        obj_kwargs = dict(kind="sphere_3d", x=16, y=16, radius=8, color=(0.8, 0.3, 0.2))
+        if with_metadata:
+            obj_kwargs.update(
+                tags={"player"},
+                layer=3,
+                name="hero",
+                collision_shape=sig.CollisionShape.CIRCLE,
+            )
+        scene = sig.SceneSpec(objects=[sig.ObjectSpec(**obj_kwargs)])
+        return sig.make_scene(scene, seed=7)
+
+    plain = make(with_metadata=False)
+    tagged = make(with_metadata=True)
+
+    assert np.array_equal(plain, tagged)
+
+
+def test_scene_query_at_point_in_rect_tagged_named():
+    hero = sig.ObjectSpec(kind="sphere_3d", x=10, y=10, radius=4, tags={"player"}, name="hero")
+    enemy = sig.ObjectSpec(kind="sphere_3d", x=12, y=10, radius=4, tags={"enemy"})
+    child = sig.ObjectSpec(kind="disc", x=1, y=1, radius=1, tags={"pickup"}, name="coin")
+    wall = sig.ObjectSpec(kind="box_3d", x=100, y=100, size=8, name="wall", children=[child])
+
+    scene = sig.SceneSpec(objects=[hero, enemy, wall])
+    query = sig.SceneQuery(scene)
+
+    assert query.named("hero") is hero
+    assert query.named("coin") is child  # nested children are flattened
+    assert query.named("missing") is None
+    assert query.tagged("enemy") == [enemy]
+    assert hero in query.in_rect(0, 0, 20, 20)
+    assert wall not in query.in_rect(0, 0, 20, 20)
+    assert hero in query.at_point(10, 10)
+
+
+def test_check_collision_and_find_collisions():
+    circle_a = sig.ObjectSpec(
+        kind="sphere_3d", x=0, y=0, radius=4, collision_shape=sig.CollisionShape.CIRCLE
+    )
+    circle_b = sig.ObjectSpec(
+        kind="sphere_3d", x=6, y=0, radius=4, collision_shape=sig.CollisionShape.CIRCLE
+    )
+    circle_far = sig.ObjectSpec(
+        kind="sphere_3d", x=100, y=100, radius=4, collision_shape=sig.CollisionShape.CIRCLE
+    )
+    box = sig.ObjectSpec(kind="box_3d", x=0, y=0, size=10, collision_shape=sig.CollisionShape.AABB)
+    box_far = sig.ObjectSpec(
+        kind="box_3d", x=200, y=200, size=10, collision_shape=sig.CollisionShape.AABB
+    )
+    passive = sig.ObjectSpec(kind="sphere_3d", x=0, y=0, radius=4)  # collision_shape=NONE
+
+    assert sig.check_collision(circle_a, circle_b)
+    assert not sig.check_collision(circle_a, circle_far)
+    assert sig.check_collision(box, circle_a)
+    assert not sig.check_collision(box, circle_far)
+    assert not sig.check_collision(box, box_far)
+    assert not sig.check_collision(circle_a, passive)
+
+    pairs = sig.find_collisions([circle_a, circle_b, circle_far, box, box_far, passive])
+    assert (circle_a, circle_b) in pairs or (circle_b, circle_a) in pairs
+    assert (box, circle_a) in pairs or (circle_a, box) in pairs
+    assert all(passive not in pair for pair in pairs)
+
+
+def test_camera_world_screen_round_trip_and_culling():
+    cam = sig.CameraSpec(viewport_width=640, viewport_height=480, world_x=100, world_y=50, zoom=2.0)
+    sx, sy = sig.world_to_screen(100, 50, cam)
+    assert (sx, sy) == (320.0, 240.0)
+    wx, wy = sig.screen_to_world(sx, sy, cam)
+    assert (round(wx, 6), round(wy, 6)) == (100.0, 50.0)
+
+    assert sig.aabb_in_view(sig.BoundingBox(90, 40, 110, 60), cam)
+    assert not sig.aabb_in_view(sig.BoundingBox(10_000, 10_000, 10_010, 10_010), cam)
+
+
+def test_layer_manager_sorts_by_layer_then_depth():
+    mgr = sig.LayerManager()
+    mgr.add_layer("bg", order=0, parallax=0.5)
+    mgr.add_layer("world", order=1, parallax=1.0)
+
+    far = sig.ObjectSpec(kind="tree", depth=0.9, layer=1)
+    near = sig.ObjectSpec(kind="tree", depth=0.2, layer=1)
+    bg = sig.ObjectSpec(kind="tree", depth=0.5, layer=0)
+
+    ordered = mgr.sort_objects([far, near, bg])
+    assert ordered[0] is bg
+    assert ordered[1] is far and ordered[2] is near  # far-to-near within a layer
+
+
+def test_sprite_atlas_stamp_and_flipbook():
+    atlas_img = np.zeros((16, 16, 4), np.uint8)
+    atlas_img[0:8, 0:8] = (255, 0, 0, 255)
+    region = sig.AtlasRegion(name="red", x=0, y=0, width=8, height=8)
+    atlas = sig.AtlasSpec(image=atlas_img, regions=(region,), default_region="red")
+
+    canvas = np.zeros((32, 32, 4), np.uint8)
+    sig.stamp_sprite(canvas, atlas, atlas.get("red"), x=16, y=16)
+    assert tuple(canvas[16, 16]) == (255, 0, 0, 255)
+    assert tuple(canvas[0, 0]) == (0, 0, 0, 0)
+
+    clip = sig.FlipbookClip(frames=(region, region), frame_duration_ms=100, loop=True)
+    assert sig.flipbook_region(clip, 50) is clip.frames[0]
+    assert sig.flipbook_region(clip, 250) is clip.frames[0]  # wraps
+
+
+def test_particle_pool_emit_update_render_lifecycle():
+    rng = np.random.RandomState(0)
+    emitter = sig.ParticleEmitterSpec(lifetime=(1.0, 1.0), speed=(0, 0), max_particles=8)
+    pool = sig.ParticlePool(emitter)
+
+    assert pool.emit(5, (16, 16), rng) == 5
+    pool.update(0.5)
+    assert pool.alive.sum() == 5
+    pool.update(0.6)  # ages exceed lifetime
+    assert pool.alive.sum() == 0
+
+    pool.emit(1, (16, 16), rng)
+    canvas = np.zeros((32, 32, 4), np.uint8)
+    pool.render(canvas)
+    assert canvas[16, 16, 3] > 0
+
+
+def test_physics_world_gravity_collision_and_raycast():
+    ground = sig.ObjectSpec(kind="box_3d", x=0, y=0, size=20, collision_shape=sig.CollisionShape.AABB)
+    ball = sig.ObjectSpec(kind="sphere_3d", x=0, y=5, radius=2, collision_shape=sig.CollisionShape.CIRCLE)
+    world = sig.PhysicsWorld(gravity=(0, 0))
+    world.add_body(ground, sig.RigidBodySpec(is_static=True))
+    world.add_body(ball, sig.RigidBodySpec(mass=1.0, restitution=0.5))
+
+    hit = world.ray_cast((0, 50), (0, -1), 100)
+    assert hit is not None and hit.obj is ground
+
+    contacts = world.step(0.016)
+    assert len(contacts) == 1
+
+    falling = sig.ObjectSpec(kind="sphere_3d", x=0, y=100)
+    freefall = sig.PhysicsWorld(gravity=(0, -100))
+    freefall.add_body(falling, sig.RigidBodySpec(mass=1.0))
+    freefall.step(1.0)
+    assert falling.y < 100
+
+
+def test_input_providers_replay_and_web():
+    frames = [sig.InputState(keys_down={"left"}), sig.InputState(keys_down={"right"})]
+    replay = sig.ReplayInputProvider(frames)
+    assert replay.poll().keys_down == {"left"}
+    assert replay.poll().keys_down == {"right"}
+    assert replay.exhausted
+
+    web = sig.WebInputProvider()
+    web.push_event({"type": "keydown", "key": "a"})
+    state = web.poll()
+    assert state.keys_down == {"a"} and state.keys_pressed == {"a"}
+    assert web.poll().keys_pressed == set()  # transient set clears after poll
+
+    assert sig.NullInputProvider().poll() == sig.InputState()
+
+
+def test_game_clock_fixed_steps_and_scene_graph_tick():
+    clock = sig.GameClock(fixed_timestep=1 / 60)
+    assert clock.tick(1 / 30) == 2  # two 60Hz steps fit in one 1/30s frame
+    assert clock.tick(10.0) == round(0.25 / (1 / 60))  # spiral-of-death guard
+
+    scene = sig.SceneSpec(objects=[sig.ObjectSpec(kind="sphere_3d", x=16, y=16, radius=6)])
+    graph = sig.SceneGraph(scene_spec=scene, camera=sig.CameraSpec(viewport_width=32, viewport_height=32))
+    frame = graph.tick(1 / 60, sig.InputState())
+    assert frame.shape == (32, 32, 4) and frame.dtype == np.uint8
+
+
+def test_hud_renders_and_dispatches_click_on_press_edge():
+    button = sig.WidgetSpec(kind="button", x=10, y=10, width=40, height=20, text="OK", on_click="confirm")
+    hud = sig.HUD([button])
+
+    canvas = np.zeros((64, 64, 4), np.uint8)
+    hud.render(canvas)
+    assert canvas[15, 15, 3] > 0
+
+    click = sig.InputState(mouse_x=20, mouse_y=15, mouse_buttons={0})
+    assert hud.handle_input(click) == ["confirm"]
+    assert hud.handle_input(click) == []  # held, not a new press
+
+
+def test_tween_and_keyframe_track():
+    obj = sig.ObjectSpec(kind="sphere_3d", name="hero", x=0)
+    scene = sig.SceneSpec(objects=[obj])
+    track = sig.AnimationTrack([sig.Tween(target="hero", property="x", from_value=0, to_value=100, duration=1.0)])
+    track.update(0.5, scene)
+    assert obj.x == 50.0
+    track.update(0.5, scene)
+    assert obj.x == 100.0 and track.finished
+
+    kf = sig.KeyframeTrack("hero", [sig.Keyframe(0, {"y": 0}), sig.Keyframe(2, {"y": 10})])
+    assert kf.sample(1)["y"] == 5.0
+
+
+def test_tilemap_storage_collision_mask_and_render():
+    atlas_img = np.zeros((8, 16, 4), np.uint8)
+    atlas_img[:, 0:8] = (255, 0, 0, 255)
+    atlas_img[:, 8:16] = (0, 255, 0, 255)
+    tileset = sig.AtlasSpec(
+        image=atlas_img,
+        regions=(
+            sig.AtlasRegion(name="grass", x=0, y=0, width=8, height=8),
+            sig.AtlasRegion(name="water", x=8, y=0, width=8, height=8),
+        ),
+    )
+    tiles = np.zeros((4, 4), np.uint16)
+    tiles[1, 1] = 1
+    tilemap = sig.TilemapSpec(width=4, height=4, tile_size=8, tiles=tiles, tileset=tileset)
+
+    assert tilemap.tile_at(1, 1) == 1
+    tilemap.set_tile(0, 0, 2)
+    assert tilemap.collision_mask()[0, 0] and not tilemap.collision_mask()[3, 3]
+
+    cam = sig.CameraSpec(viewport_width=32, viewport_height=32, world_x=16, world_y=16, zoom=1.0)
+    frame = sig.TilemapRenderer.render(tilemap, cam)
+    assert frame.shape == (32, 32, 4)
+    assert frame[..., 3].sum() > 0
+
+
+def test_session_record_save_load_round_trip(tmp_path):
+    obj = sig.ObjectSpec(kind="sphere_3d", x=1.0, y=2.0, name="hero")
+    snap = sig.serialize_objects([obj])
+
+    recorder = sig.SessionRecorder()
+    recorder.record(sig.FrameRecord(frame=0, time=0.0, input=sig.InputState(keys_down={"left"}), objects_state=snap))
+
+    path = tmp_path / "session.json"
+    recorder.save(str(path))
+    loaded = sig.SessionRecorder.load(str(path))
+
+    assert len(loaded.frames) == 1
+    assert loaded.frames[0].input.keys_down == {"left"}
+    assert loaded.frames[0].objects_state == snap
+
+
+def test_export_html_writes_self_contained_interactive_file(tmp_path):
+    class FakeGraph:
+        objects = [
+            sig.ObjectSpec(kind="sphere_3d", x=10, y=10, radius=4, color=(1, 0, 0), tags={"player"}),
+            sig.ObjectSpec(kind="box_3d", x=50, y=50, size=8, color=(0, 1, 0)),
+        ]
+
+    path = tmp_path / "scene.html"
+    sig.export_html(FakeGraph(), str(path), width=320, height=240, title="Test Scene")
+
+    content = path.read_text()
+    assert "<canvas" in content and "Test Scene" in content
+    assert '"player"' in content
