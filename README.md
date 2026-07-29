@@ -3,6 +3,8 @@
 `synthetic-image-generator` is a deterministic procedural image library with
 154 indexed content levels, composable scenes, transparency, resizing,
 quantization, dithering, packed pixel formats, and ordered batch generation.
+An optional scene-graph layer adds camera/physics/particles/tilemaps/HUD/
+tweens on top, for simple 2D games and interactive demos.
 
 The canonical indexed contract returns a NumPy `float32` RGB image with shape
 `(32, 32, 3)` and values in `[0, 1]`. A non-negative index always maps to the
@@ -267,6 +269,58 @@ assert image.shape == (32, 32, 3)
 Objects are composed from far to near according to `depth`. Child reference
 cycles, invalid seeds, non-finite depths, unsupported objects, and malformed
 scene components are rejected before rendering.
+
+## Scene graph / mini game engine
+
+An additive layer on top of `make_scene` adds camera/viewport transforms,
+named layers with parallax, sprite atlases, a particle system, lightweight
+2D physics, an input abstraction (with deterministic replay), a
+fixed-timestep game loop, a HUD/widget system, tweens, tilemaps, session
+record/replay, and a single-file HTML export. Every piece is a satellite
+module that either never imports the renderer or only calls the public
+`make_scene`/`make_scene_raster` functions like any other caller, so the
+indexed contract and existing `make_scene` calls are unaffected.
+
+```python
+from synthetic_image_generator import (
+    CameraSpec, CollisionShape, InputState, ObjectSpec, PhysicsWorld,
+    RigidBodySpec, SceneGraph, SceneSpec,
+)
+
+ground = ObjectSpec(kind="box_3d", x=16, y=4, size=32, collision_shape=CollisionShape.AABB)
+ball = ObjectSpec(kind="sphere_3d", x=16, y=28, radius=3, collision_shape=CollisionShape.CIRCLE, name="ball")
+
+physics = PhysicsWorld(gravity=(0, -50))
+physics.add_body(ground, RigidBodySpec(is_static=True))
+physics.add_body(ball, RigidBodySpec(mass=1.0, restitution=0.4))
+
+graph = SceneGraph(
+    scene_spec=SceneSpec(objects=[ground, ball]),
+    camera=CameraSpec(viewport_width=64, viewport_height=64),
+    physics=physics,
+    seed=7,
+)
+
+frame = graph.tick(1 / 60, InputState())
+assert frame.shape == (64, 64, 4)
+```
+
+`SceneGraph.update()` (called once per fixed step inside `tick()`) drives
+physics, `animations` (`Tween`/`AnimationTrack`), particle auto-emission for
+any `ParticlePool` with an `origin` set, flipbook playback, and HUD click
+dispatch. `SceneGraph.render()` composites, bottom to top: `tilemaps` ->
+the scene (per-`layer` via `LayerManager` if any are registered, otherwise
+one `make_scene` call) -> sprite-tagged objects (`ObjectSpec.sprite`/
+`flipbook`) -> particles -> `hud`, into one RGBA frame.
+
+This layer targets game-loop convenience, not conservation-grade physics or
+pixel-identical browser rendering — `export_html` draws flat-shaded 2D proxy
+shapes with a small interactive JS loop, not a port of the Phong-shaded 3D
+renderer. See [`SCENE_GRAPH_PLAN.md`](SCENE_GRAPH_PLAN.md) for the design
+rationale and [`CHANGELOG.md`](CHANGELOG.md) (0.10.0 onward) for what each
+phase added. It sits outside the byte-exact policy in
+[`SOURCE_OF_TRUTH.md`](SOURCE_OF_TRUTH.md), which covers `make_image`'s
+indexed contract only.
 
 ## Raster output
 
