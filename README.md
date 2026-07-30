@@ -1,5 +1,7 @@
 # Synthetic Image Generator
 
+![Generator atlas — sample of all 154 levels](media/synthetic_generator_universal_atlas.png)
+
 `synthetic-image-generator` is a deterministic procedural image library with
 154 indexed content levels, native arbitrary-resolution rendering, composable
 scenes with procedural materials and semantic layout, 16 camera post-effects,
